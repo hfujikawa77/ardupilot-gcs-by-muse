@@ -1,0 +1,14 @@
+node_modules/
+dist/
+dist-cvm/
+.generated/
+*.tsbuildinfo
+app.db
+app.db-shm
+app.db-wal
+.sitl-runtime/
+.space-build/
+.space-build-cvm/
+.bun-cache/
+.harness/
+audits/
