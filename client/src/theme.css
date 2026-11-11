@@ -152,8 +152,9 @@ body {
 /* tab bar for the side panel (QGC-style view switching) */
 .tab-btn {
   flex: 1 1 0;
-  padding: 8px 4px;
-  font-size: 12px;
+  min-width: 0;
+  padding: 8px 2px;
+  font-size: 11px;
   line-height: 1.2;
   color: var(--dim);
   background: transparent;

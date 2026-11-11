@@ -60,6 +60,9 @@ const statusResponse = z.object({
   joyUpdatedAgoMs: z.number().nullable(),
   missionCurrent: z.number().nullable(),
   missionReached: z.number().nullable(),
+  paramState: z.string(),
+  paramCount: z.number(),
+  paramTotal: z.number().nullable(),
   modes: z.array(z.string()),
 });
 
@@ -83,6 +86,28 @@ const missionResponse = z.object({
 });
 
 type MissionResponse = z.infer<typeof missionResponse>;
+
+const paramListResponse = z.object({
+  ok: z.boolean(),
+  message: z.string(),
+  state: z.string(),
+  total: z.number().nullable(),
+  params: z.array(z.object({
+    name: z.string(),
+    value: z.number(),
+    ptype: z.number(),
+  })),
+});
+
+type ParamListResponse = z.infer<typeof paramListResponse>;
+
+const paramSetResponse = z.object({
+  ok: z.boolean(),
+  message: z.string(),
+  value: z.number().nullable(),
+});
+
+type ParamSetResponse = z.infer<typeof paramSetResponse>;
 
 const aiMissionResult = z.object({
   summary: z.string(),
@@ -134,7 +159,9 @@ function disconnectedSnapshot(message: string): StatusResponse {
     homeLat: null, homeLon: null, ekfHealthy: null,
     rcChannels: [], track: [], messages: [], acks: [],
     joyEnabled: false, joyStreaming: false, joyUpdatedAgoMs: null,
-    missionCurrent: null, missionReached: null, modes: COPTER_MODE_NAMES,
+    missionCurrent: null, missionReached: null,
+    paramState: "idle", paramCount: 0, paramTotal: null,
+    modes: COPTER_MODE_NAMES,
   };
 }
 
@@ -183,6 +210,9 @@ export const Actions = {
           // Tolerate a snapshot from an older bridge build.
           missionCurrent: typeof snap.missionCurrent === "number" ? snap.missionCurrent : null,
           missionReached: typeof snap.missionReached === "number" ? snap.missionReached : null,
+          paramState: typeof snap.paramState === "string" ? snap.paramState : "idle",
+          paramCount: typeof snap.paramCount === "number" ? snap.paramCount : 0,
+          paramTotal: typeof snap.paramTotal === "number" ? snap.paramTotal : null,
           modes: COPTER_MODE_NAMES,
         } as StatusResponse;
       } catch (e) {
@@ -342,6 +372,79 @@ export const Actions = {
     privileged: [privileged.bridgeCall],
     async handler(ctx, args): Promise<OkResponse> {
       return command(ctx, "/mission/start", { takeoffAltM: args.takeoffAltM });
+    },
+  }),
+
+  fetchParams: defineAction({
+    description: "Starts a full parameter download from the vehicle (PARAM_REQUEST_LIST) on the bridge; progress is reported through the getStatus snapshot (paramState/paramCount/paramTotal) and the result is read with getParams.",
+    request: z.object({}),
+    response: okResponse,
+    privileged: [privileged.bridgeCall],
+    async handler(ctx): Promise<OkResponse> {
+      return command(ctx, "/params/fetch", {});
+    },
+  }),
+
+  getParams: defineAction({
+    description: "Returns the parameter cache the bridge holds for the vehicle (name, current value, MAV_PARAM_TYPE), plus the fetch state and the vehicle's reported total count.",
+    request: z.object({}),
+    response: paramListResponse,
+    privileged: [privileged.bridgeCall],
+    async handler(ctx): Promise<ParamListResponse> {
+      try {
+        const r = await bridge(ctx, "GET", "/params/list");
+        const params = Array.isArray(r.params)
+          ? (r.params as Record<string, unknown>[]).flatMap((raw) => {
+              const name = typeof raw.name === "string" ? raw.name : "";
+              const value = typeof raw.value === "number" ? raw.value : NaN;
+              const ptype = typeof raw.ptype === "number" ? raw.ptype : 9;
+              return name && Number.isFinite(value) ? [{ name, value, ptype }] : [];
+            })
+          : [];
+        return {
+          ok: r.ok === true,
+          message: typeof r.message === "string" ? r.message : "",
+          state: typeof r.state === "string" ? r.state : "idle",
+          total: typeof r.total === "number" ? r.total : null,
+          params,
+        };
+      } catch (e) {
+        return {
+          ok: false,
+          message: `ブリッジに到達できません: ${e instanceof Error ? e.message : String(e)}`,
+          state: "error",
+          total: null,
+          params: [],
+        };
+      }
+    },
+  }),
+
+  setParam: defineAction({
+    description: "Writes one parameter to the vehicle with PARAM_SET and confirms it from the vehicle's echoed PARAM_VALUE; ok=false means the vehicle did not accept/echo the value.",
+    request: z.object({
+      name: z.string().min(1).max(16),
+      value: z.number().finite(),
+    }),
+    response: paramSetResponse,
+    privileged: [privileged.bridgeCall],
+    async handler(ctx, args): Promise<ParamSetResponse> {
+      try {
+        const r = await bridge(ctx, "POST", "/params/set", {
+          name: args.name, value: args.value,
+        });
+        return {
+          ok: r.ok === true,
+          message: typeof r.message === "string" ? r.message : "",
+          value: typeof r.value === "number" ? r.value : null,
+        };
+      } catch (e) {
+        return {
+          ok: false,
+          message: `ブリッジに到達できません: ${e instanceof Error ? e.message : String(e)}`,
+          value: null,
+        };
+      }
     },
   }),
 

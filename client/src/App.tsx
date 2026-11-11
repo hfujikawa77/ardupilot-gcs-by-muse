@@ -1,16 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, type ApiResponse } from "./api";
 import { Hud } from "./Hud";
 import { MapPanel, type LatLon } from "./MapPanel";
 import { Stick } from "./Joystick";
+import { TelemetryTiles } from "./TelemetryTiles";
 
 type Status = ApiResponse<typeof api, "getStatus">;
-type TabId = "fly" | "mission" | "goto" | "stick" | "telemetry" | "log";
+type TabId = "fly" | "mission" | "params" | "goto" | "stick" | "telemetry" | "log";
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "fly", label: "飛行" },
   { id: "mission", label: "ミッション" },
+  { id: "params", label: "パラメータ" },
   { id: "goto", label: "Goto" },
   { id: "stick", label: "スティック" },
   { id: "telemetry", label: "テレメトリ" },
@@ -203,19 +205,397 @@ function SlideConfirm({
   );
 }
 
-function Readout({ label, value, unit, accent, small }: {
-  label: string; value: string; unit?: string; accent?: boolean; small?: boolean;
+// ---- parameters tab (UXDuck-style: stage edits, write explicitly) ----
+// Edits accumulate locally and reach the vehicle only when the user
+// slides the write control; each write is confirmed from the vehicle's
+// echoed PARAM_VALUE by the bridge, and the row then shows the value
+// the vehicle actually holds. Display metadata (names, descriptions,
+// units, ranges, enum/bitmask labels) comes from the official ArduPilot
+// parameter definitions, lazily loaded from ./paramMeta.
+interface VehicleParam { name: string; value: number; ptype: number }
+type ParamMetaMap = Record<string, import("./paramMeta").ParamMeta>;
+
+function fmtParamValue(v: number): string {
+  if (Number.isInteger(v)) return String(v);
+  return String(Number.parseFloat(v.toFixed(6)));
+}
+
+function ParamsPanel({ connected, paramState, paramCount, paramTotal }: {
+  connected: boolean;
+  paramState: string;
+  paramCount: number;
+  paramTotal: number | null;
 }) {
+  const [params, setParams] = useState<VehicleParam[] | null>(null);
+  const [meta, setMeta] = useState<ParamMetaMap | null>(null);
+  const [query, setQuery] = useState("");
+  const [onlyChanged, setOnlyChanged] = useState(false);
+  const [edits, setEdits] = useState<Record<string, string>>({});
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [fetching, setFetching] = useState(false);
+  const [writing, setWriting] = useState(false);
+  const [marks, setMarks] = useState<Record<string, "ok" | "fail">>({});
+  const [needsReboot, setNeedsReboot] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    import("./paramMeta")
+      .then((m) => { if (alive) setMeta(m.PARAM_META); })
+      .catch(() => { if (alive) setMeta({}); });
+    return () => { alive = false; };
+  }, []);
+
+  const loadList = useCallback(async () => {
+    try {
+      const r = await api.getParams({});
+      if (r.params.length > 0) setParams(r.params);
+      return r;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  // Show whatever the bridge already holds (e.g. fetched before this
+  // tab was opened).
+  useEffect(() => { void loadList(); }, [loadList]);
+
+  // Follow the bridge-side fetch through the status snapshot.
+  useEffect(() => {
+    if (paramState === "fetching") {
+      setFetching(true);
+      return;
+    }
+    if (!fetching) return;
+    if (paramState === "done") {
+      setFetching(false);
+      void loadList().then((r) => {
+        if (r && r.params.length > 0) setMsg(`パラメータを${r.params.length}件取得しました`);
+      });
+    } else if (paramState === "error") {
+      setFetching(false);
+      setMsg("パラメータ取得に失敗しました。接続を確認してもう一度試してください");
+    }
+  }, [paramState, fetching, loadList]);
+
+  const byName = useMemo(
+    () => new Map((params ?? []).map((p) => [p.name, p])),
+    [params],
+  );
+
+  const parsedEdit = useCallback((name: string): number | null => {
+    const raw = edits[name];
+    if (raw === undefined) return null;
+    const v = Number(raw);
+    return Number.isFinite(v) ? v : null;
+  }, [edits]);
+
+  const changedNames = useMemo(() => {
+    const out: string[] = [];
+    for (const name of Object.keys(edits)) {
+      const cur = byName.get(name);
+      const v = parsedEdit(name);
+      if (cur && v !== null && Math.abs(v - cur.value) > 1e-9) out.push(name);
+    }
+    return out;
+  }, [edits, byName, parsedEdit]);
+
+  const startFetch = async () => {
+    setMsg(null);
+    setMarks({});
+    try {
+      const r = await api.fetchParams({});
+      setMsg(r.message);
+      if (r.ok) setFetching(true);
+    } catch (e) {
+      setMsg(`取得開始エラー: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  const writeAll = async () => {
+    if (writing || changedNames.length === 0) return;
+    setWriting(true);
+    setMsg(`${changedNames.length}件を書き込み中…`);
+    let okCount = 0;
+    let reboot = false;
+    const failures: string[] = [];
+    for (const name of changedNames) {
+      const v = parsedEdit(name);
+      if (v === null) continue;
+      try {
+        const r = await api.setParam({ name, value: v });
+        if (r.ok && r.value !== null) {
+          okCount += 1;
+          const echoed = r.value;
+          setParams((prev) =>
+            prev?.map((p) => (p.name === name ? { ...p, value: echoed } : p)) ?? prev);
+          setEdits((prev) => {
+            const next = { ...prev };
+            delete next[name];
+            return next;
+          });
+          setMarks((prev) => ({ ...prev, [name]: "ok" }));
+          if (meta?.[name]?.reboot) reboot = true;
+        } else {
+          failures.push(`${name}: ${r.message}`);
+          setMarks((prev) => ({ ...prev, [name]: "fail" }));
+        }
+      } catch (e) {
+        failures.push(`${name}: ${e instanceof Error ? e.message : String(e)}`);
+        setMarks((prev) => ({ ...prev, [name]: "fail" }));
+      }
+    }
+    setNeedsReboot(reboot);
+    setMsg(
+      failures.length > 0
+        ? `${okCount}件書き込み、${failures.length}件失敗（${failures[0]}）`
+        : `${okCount}件のパラメータを書き込みました`,
+    );
+    setWriting(false);
+  };
+
+  const setEdit = (name: string, raw: string) => {
+    setEdits((prev) => ({ ...prev, [name]: raw }));
+    setMarks((prev) => {
+      if (!prev[name]) return prev;
+      const next = { ...prev };
+      delete next[name];
+      return next;
+    });
+  };
+
+  const q = query.trim().toLowerCase();
+  const filtered = (params ?? []).filter((p) => {
+    if (onlyChanged && !changedNames.includes(p.name)) return false;
+    if (!q) return true;
+    const m = meta?.[p.name];
+    return (
+      p.name.toLowerCase().includes(q) ||
+      (m?.label ?? "").toLowerCase().includes(q) ||
+      (m?.desc ?? "").toLowerCase().includes(q)
+    );
+  });
+  const shown = filtered.slice(0, 200);
+
   return (
-    <div className="rounded-lg px-2.5 py-2" style={{ background: "var(--surface-2)" }}>
-      <div className="text-[10px]" style={{ color: "var(--dim)" }}>{label}</div>
-      <div
-        className={`mono leading-tight ${small ? "text-[13px]" : "text-lg"}`}
-        style={{ color: accent ? "var(--accent)" : "var(--text)" }}
-      >
-        {value}
-        {unit && <span className="ml-1 text-[11px]" style={{ color: "var(--dim)" }}>{unit}</span>}
+    <div className="flex flex-col gap-2.5">
+      <p className="text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+        編集はこの画面の中だけに溜まり、「書き込む」を押すまで機体へは送られません。
+        書き込み後は、機体が返した値で受理を確認して表示します。
+      </p>
+
+      <div className="flex flex-wrap items-center gap-1.5">
+        <button
+          type="button" className="btn active"
+          disabled={!connected || fetching}
+          onClick={() => void startFetch()}
+        >
+          {fetching
+            ? `取得中… ${paramCount}${paramTotal !== null ? ` / ${paramTotal}` : ""}件`
+            : params ? "パラメータを再取得" : "パラメータを取得"}
+        </button>
+        {params && (
+          <span className="mono text-[11px]" style={{ color: "var(--dim)" }}>
+            {params.length}件
+          </span>
+        )}
+        <label className="ml-auto flex items-center gap-1.5 text-xs" style={{ color: "var(--dim)" }}>
+          <input
+            type="checkbox" checked={onlyChanged}
+            onChange={(e) => setOnlyChanged(e.target.checked)}
+            aria-label="変更したパラメータだけ表示"
+          />
+          変更のみ（{changedNames.length}）
+        </label>
       </div>
+
+      <input
+        className="inp mono w-full"
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="パラメータ名・説明で検索（例: RTL_ALT）"
+        aria-label="パラメータ検索"
+      />
+
+      {changedNames.length > 0 && (
+        <div
+          className="flex flex-col gap-1.5 rounded-lg p-2"
+          style={{ background: "rgba(245,184,61,0.08)", border: "1px solid var(--warn)" }}
+        >
+          <div className="flex items-center gap-2">
+            <span className="text-xs" style={{ color: "var(--warn)" }}>
+              未書き込みの変更が{changedNames.length}件あります
+            </span>
+            <button
+              type="button" className="btn ml-auto !px-2 !py-1 text-[11px]"
+              disabled={writing}
+              onClick={() => setEdits({})}
+            >
+              変更を破棄
+            </button>
+          </div>
+          <SlideConfirm
+            label={`書き込む (${changedNames.length}件)`}
+            ariaLabel={`変更したパラメータ${changedNames.length}件を機体へ書き込む: 右端までスライドで実行`}
+            disabled={writing || !connected}
+            onConfirm={() => void writeAll()}
+          />
+        </div>
+      )}
+
+      {needsReboot && (
+        <p className="text-xs" style={{ color: "var(--warn)" }}>
+          再起動が必要なパラメータが含まれます。変更を反映するには機体の再起動が必要です（SITLは接続し直すと再起動します）。
+        </p>
+      )}
+      {msg && (
+        <p className="mono text-[11px]" style={{ color: "var(--dim)" }} role="status">{msg}</p>
+      )}
+
+      {params === null ? (
+        <p className="text-xs" style={{ color: "var(--dim)" }}>
+          {connected
+            ? "まだパラメータを取得していません。「パラメータを取得」で機体から読み込みます（SITLでは通常1〜2秒、全1,400件ほど）。"
+            : "機体に接続するとパラメータを取得できます。"}
+        </p>
+      ) : filtered.length === 0 ? (
+        <p className="text-xs" style={{ color: "var(--dim)" }}>
+          条件に合うパラメータがありません。
+        </p>
+      ) : (
+        <div>
+          {filtered.length > shown.length && (
+            <p className="mb-1 text-[11px]" style={{ color: "var(--dim)" }}>
+              {filtered.length}件中、最初の{shown.length}件を表示しています。検索で絞り込んでください。
+            </p>
+          )}
+          <div className="flex flex-col">
+            {shown.map((p) => {
+              const m = meta?.[p.name];
+              const editRaw = edits[p.name];
+              const parsed = parsedEdit(p.name);
+              const changed = changedNames.includes(p.name);
+              const invalid = editRaw !== undefined && parsed === null;
+              const mark = marks[p.name];
+              const isOpen = expanded === p.name;
+              const enumLabel = m?.values?.find(([v]) => Math.abs(v - p.value) < 1e-9)?.[1];
+              return (
+                <div
+                  key={p.name}
+                  style={{ borderBottom: "1px solid var(--border)" }}
+                >
+                  <div className="flex items-center gap-1.5 py-1">
+                    <button
+                      type="button"
+                      className="shrink-0 px-1 text-[11px]"
+                      style={{ color: "var(--dim)", background: "transparent", border: "none", cursor: "pointer" }}
+                      aria-label={`${p.name}の説明を${isOpen ? "閉じる" : "開く"}`}
+                      aria-expanded={isOpen}
+                      onClick={() => setExpanded(isOpen ? null : p.name)}
+                    >
+                      {isOpen ? "▾" : "▸"}
+                    </button>
+                    <div className="min-w-0 flex-1">
+                      <div className="mono truncate text-xs">{p.name}</div>
+                      <div className="truncate text-[10px]" style={{ color: "var(--dim)" }}>
+                        {m?.label ?? ""}
+                        {enumLabel ? ` · 現在: ${enumLabel}` : ""}
+                        {m?.reboot ? " · 要再起動" : ""}
+                      </div>
+                    </div>
+                    {mark === "ok" && (
+                      <span className="text-[11px]" style={{ color: "var(--ok)" }} title="機体が受理しました">✓</span>
+                    )}
+                    {mark === "fail" && (
+                      <span className="text-[11px]" style={{ color: "var(--danger)" }} title="書き込みを確認できませんでした">✕</span>
+                    )}
+                    {changed && (
+                      <span
+                        className="h-2 w-2 shrink-0 rounded-full"
+                        style={{ background: "var(--warn)" }}
+                        title="未書き込みの変更"
+                      />
+                    )}
+                    {m?.values && !m?.bitmask ? (
+                      <select
+                        className="inp mono !h-[26px] w-[108px] shrink-0 !px-1.5 !py-0 text-[11px]"
+                        style={changed ? { borderColor: "var(--warn)" } : undefined}
+                        value={editRaw ?? String(p.value)}
+                        aria-label={`${p.name}の値`}
+                        onChange={(e) => setEdit(p.name, e.target.value)}
+                      >
+                        {!m.values.some(([v]) => Math.abs(v - p.value) < 1e-9) && (
+                          <option value={String(p.value)}>{fmtParamValue(p.value)}</option>
+                        )}
+                        {m.values.map(([v, lbl]) => (
+                          <option key={v} value={String(v)}>{lbl}</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        className="inp mono !h-[26px] w-[84px] shrink-0 !px-1.5 !py-0 text-right text-[11px]"
+                        style={{
+                          borderColor: invalid ? "var(--danger)" : changed ? "var(--warn)" : undefined,
+                        }}
+                        value={editRaw ?? fmtParamValue(p.value)}
+                        inputMode="decimal"
+                        aria-label={`${p.name}の値`}
+                        onChange={(e) => setEdit(p.name, e.target.value)}
+                      />
+                    )}
+                    {m?.units && (
+                      <span className="w-10 shrink-0 truncate text-[10px]" style={{ color: "var(--dim)" }}>
+                        {m.units}
+                      </span>
+                    )}
+                  </div>
+                  {isOpen && (
+                    <div className="pb-2 pl-6 pr-1 text-[11px] leading-relaxed" style={{ color: "var(--dim)" }}>
+                      {m?.desc ? <p>{m.desc}</p> : <p>説明メタデータがありません。</p>}
+                      <p className="mono mt-1">
+                        現在値: {fmtParamValue(p.value)}
+                        {m?.min !== undefined && m?.max !== undefined
+                          ? ` · 範囲: ${m.min} 〜 ${m.max}`
+                          : ""}
+                        {m?.units ? ` · 単位: ${m.units}` : ""}
+                      </p>
+                      {m?.values && (
+                        <p className="mono mt-1">
+                          選択肢: {m.values.map(([v, lbl]) => `${fmtParamValue(v)}=${lbl}`).join(", ")}
+                        </p>
+                      )}
+                      {m?.bitmask && (
+                        <div className="mt-1.5 flex flex-col gap-1">
+                          {m.bitmask.map(([bit, lbl]) => {
+                            const cur = parsed ?? p.value;
+                            const on = (Math.round(cur) & (1 << bit)) !== 0;
+                            return (
+                              <label key={bit} className="flex items-center gap-1.5">
+                                <input
+                                  type="checkbox" checked={on}
+                                  aria-label={`${p.name}のビット${bit}: ${lbl}`}
+                                  onChange={(e) => {
+                                    const base = Math.round(parsed ?? p.value);
+                                    const next = e.target.checked
+                                      ? base | (1 << bit)
+                                      : base & ~(1 << bit);
+                                    setEdit(p.name, String(next));
+                                  }}
+                                />
+                                <span>{lbl}</span>
+                              </label>
+                            );
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -946,7 +1326,7 @@ export function App() {
               aria-label="操作パネルを畳んで地図を広げる"
               aria-expanded={true}
               onClick={() => setPanelOpen(false)}
-              className="shrink-0 px-2.5 text-sm"
+              className="shrink-0 px-1.5 text-sm"
               style={{ color: "var(--dim)", background: "transparent", border: "none", cursor: "pointer" }}
             >
               ▾
@@ -1454,20 +1834,7 @@ export function App() {
 
             {tab === "telemetry" && (
               <div className="flex flex-col gap-3">
-                <div className="grid grid-cols-3 gap-2">
-                  <Readout label="相対高度" value={fmt(s?.altRelM ?? null)} unit="m" accent />
-                  <Readout label="対地速度" value={fmt(s?.groundspeedMs ?? null)} unit="m/s" />
-                  <Readout label="上昇率" value={fmt(s?.climbMs ?? null)} unit="m/s" />
-                  <Readout label="スロットル" value={fmt(s?.throttlePct ?? null, 0)} unit="%" />
-                  <Readout label="MSL高度" value={fmt(s?.altMslM ?? null)} unit="m" />
-                  <Readout label="ホーム距離" value={distHome === null ? "—" : fmt(distHome, 0)} unit="m" />
-                  <Readout label="緯度" value={s?.lat != null ? s.lat.toFixed(6) : "—"} small />
-                  <Readout label="経度" value={s?.lon != null ? s.lon.toFixed(6) : "—"} small />
-                  <Readout label="HDOP" value={fmt(s?.gpsHdop ?? null, 2)} />
-                  <Readout label="ロール" value={fmt(s?.rollDeg ?? null, 0)} unit="°" />
-                  <Readout label="ピッチ" value={fmt(s?.pitchDeg ?? null, 0)} unit="°" />
-                  <Readout label="ヨー" value={fmt(s?.yawDeg ?? null, 0)} unit="°" />
-                </div>
+                <TelemetryTiles s={s} distHome={distHome} />
                 {s && s.rcChannels.length > 0 && (
                   <div>
                     <div className="panel-title mb-1.5">RCチャンネル</div>
@@ -1491,6 +1858,15 @@ export function App() {
                   </div>
                 )}
               </div>
+            )}
+
+            {tab === "params" && (
+              <ParamsPanel
+                connected={connected}
+                paramState={s?.paramState ?? "idle"}
+                paramCount={s?.paramCount ?? 0}
+                paramTotal={s?.paramTotal ?? null}
+              />
             )}
 
             {tab === "log" && (

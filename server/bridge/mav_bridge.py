@@ -73,9 +73,15 @@ S = {
     # Mission transfer state: while missionBusy is set, mav_loop parks
     # its receiver so the transfer thread owns the socket reads.
     "missionBusy": False, "missionCurrent": None, "missionReached": None,
+    # Parameter cache (name -> {value, ptype, index}), filled by
+    # PARAM_VALUE messages. paramBusy parks mav_loop the same way
+    # missionBusy does while a fetch/set exchange owns the socket reads.
+    "params": {}, "paramState": "idle", "paramTotal": None,
+    "paramBusy": False,
 }
 
 mission_lock = threading.Lock()
+param_lock = threading.Lock()
 
 
 def now_iso():
@@ -196,6 +202,22 @@ def dispatch(msg):
                 S["messages"].insert(
                     0, {"at": now_iso(), "severity": msg.severity, "text": text})
                 del S["messages"][100:]
+        elif t == "PARAM_VALUE":
+            pid = msg.param_id
+            if isinstance(pid, bytes):
+                pid = pid.decode("utf-8", "replace")
+            pid = pid.strip("\x00").strip()
+            if pid:
+                # pymavlink returns param_value already decoded to the
+                # parameter's numeric value for integer types too
+                # (verified live against the SITL).
+                S["params"][pid] = {
+                    "value": float(msg.param_value),
+                    "ptype": int(msg.param_type),
+                    "index": int(msg.param_index),
+                }
+                if msg.param_count:
+                    S["paramTotal"] = int(msg.param_count)
         elif t == "MISSION_CURRENT":
             S["missionCurrent"] = msg.seq
         elif t == "MISSION_ITEM_REACHED":
@@ -241,6 +263,9 @@ def mav_loop():
                 S["conn"] = "connected"
                 S["lastError"] = None
                 S["track"] = []
+                S["params"] = {}
+                S["paramState"] = "idle"
+                S["paramTotal"] = None
             push_log(6, f"SITLへ接続しました ({host}:{port})")
             mav.mav.request_data_stream_send(
                 mav.target_system, mav.target_component,
@@ -252,7 +277,7 @@ def mav_loop():
                 with lock:
                     if not S["wantConnected"]:
                         break
-                    busy = S["missionBusy"]
+                    busy = S["missionBusy"] or S["paramBusy"]
                 if busy:
                     # A mission transfer owns the socket reads; park
                     # here (it dispatches telemetry it receives itself).
@@ -634,6 +659,189 @@ def cmd_mission_clear():
                 S["missionBusy"] = False
 
 
+# ---- parameter fetch / set (MAVLink parameter protocol) ----
+# Same ownership pattern as the mission transfer: paramBusy parks
+# mav_loop's receiver, this thread reads the socket, and every message
+# (PARAM_VALUE included) goes through dispatch(), which maintains the
+# S["params"] cache. A GCS heartbeat is sent every second during the
+# exchange so the vehicle's GCS failsafe stays quiet.
+
+def _param_recv(mav, state, wait_s):
+    """Read for up to wait_s, dispatching everything. Returns True if
+    at least one PARAM_VALUE arrived."""
+    deadline = time.time() + wait_s
+    got = False
+    while time.time() < deadline:
+        if time.time() - state["lastHb"] > 1.0:
+            state["lastHb"] = time.time()
+            with mav_lock:
+                mav.mav.heartbeat_send(
+                    mavutil.mavlink.MAV_TYPE_GCS,
+                    mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+        msg = mav.recv_match(blocking=True, timeout=0.4)
+        if msg is None:
+            continue
+        if msg.get_type() == "PARAM_VALUE":
+            got = True
+        dispatch(msg)
+    return got
+
+
+def _param_matches(value, target, ptype):
+    if ptype in (9, 10):  # REAL32 / REAL64
+        return abs(value - target) <= 1e-3 + abs(target) * 1e-5
+    return int(round(value)) == int(round(target))
+
+
+def cmd_params_fetch():
+    """Start a full parameter fetch on a background thread and return
+    immediately: the privileged forwarder kills HTTP requests at 15 s,
+    while a fetch can take longer on a slow link. Progress is visible
+    in the status snapshot (paramState / paramCount / paramTotal) and
+    the result through GET /params/list."""
+    mav = get_mav()
+    if mav is None:
+        return {"ok": False, "message": "未接続のためパラメータを取得できません"}
+    with lock:
+        if S["paramState"] == "fetching":
+            return {"ok": True, "message": "パラメータを取得中です"}
+    threading.Thread(target=_params_fetch_run, args=(mav,), daemon=True).start()
+    return {"ok": True, "message": "パラメータ取得を開始しました"}
+
+
+def _params_fetch_run(mav):
+    with param_lock:
+        with lock:
+            S["paramBusy"] = True
+            S["paramState"] = "fetching"
+            S["params"] = {}
+            S["paramTotal"] = None
+        try:
+            time.sleep(0.3)  # let mav_loop park its receiver
+            ts, tc = mav.target_system, mav.target_component
+            state = {"lastHb": 0.0}
+            with mav_lock:
+                mav.mav.param_request_list_send(ts, tc)
+            deadline = time.time() + 45
+            last_count = 0
+            last_progress = time.time()
+            list_at = time.time()
+            read_at = 0.0
+            while time.time() < deadline:
+                with lock:
+                    count = len(S["params"])
+                    total = S["paramTotal"]
+                    indices = {e["index"] for e in S["params"].values()}
+                if count != last_count:
+                    last_count = count
+                    last_progress = time.time()
+                if total is not None and count >= total:
+                    break
+                now = time.time()
+                if total is None:
+                    if now - list_at > 3:
+                        list_at = now
+                        with mav_lock:
+                            mav.mav.param_request_list_send(ts, tc)
+                else:
+                    if now - last_progress > 6 and count >= total * 0.98:
+                        break  # only stragglers missing; stop waiting
+                    if count < total and now - read_at > 2.5:
+                        read_at = now
+                        missing = [i for i in range(total) if i not in indices][:60]
+                        with mav_lock:
+                            for idx in missing:
+                                mav.mav.param_request_read_send(ts, tc, b"", idx)
+                _param_recv(mav, state, 0.8)
+            with lock:
+                count = len(S["params"])
+                total = S["paramTotal"]
+                S["paramState"] = "done" if count else "error"
+            if count == 0:
+                with lock:
+                    S["paramState"] = "error"
+                push_log(3, "パラメータが1件も返りませんでした")
+                return
+            complete = total is not None and count >= total
+            message = f"パラメータを{count}件取得しました"
+            if not complete:
+                message += f"（全{total}件中、一部未取得）"
+            push_log(6, message)
+        except Exception as e:  # noqa: BLE001
+            with lock:
+                S["paramState"] = "error"
+            push_log(3, f"パラメータ取得に失敗: {e}")
+        finally:
+            with lock:
+                S["paramBusy"] = False
+
+
+def cmd_params_set(name, value):
+    mav = get_mav()
+    if mav is None:
+        return {"ok": False, "message": "未接続のためパラメータを書き込めません",
+                "value": None}
+    name = name.strip()
+    if not name:
+        return {"ok": False, "message": "パラメータ名が空です", "value": None}
+    with param_lock:
+        with lock:
+            entry = S["params"].get(name)
+            # Echo the type the vehicle reported for this parameter;
+            # REAL32 (9) is the fallback for an unfetched parameter.
+            ptype = entry["ptype"] if entry else 9
+            S["paramBusy"] = True
+        try:
+            time.sleep(0.3)
+            ts, tc = mav.target_system, mav.target_component
+            state = {"lastHb": 0.0}
+            with mav_lock:
+                mav.mav.param_set_send(ts, tc, name.encode("ascii"), float(value), ptype)
+            deadline = time.time() + 8
+            resent = False
+            echoed = None
+            while time.time() < deadline:
+                _param_recv(mav, state, 0.8)
+                with lock:
+                    e = S["params"].get(name)
+                if e is not None and _param_matches(e["value"], value, ptype):
+                    echoed = e["value"]
+                    break
+                if not resent and time.time() > deadline - 4:
+                    resent = True
+                    with mav_lock:
+                        mav.mav.param_set_send(
+                            ts, tc, name.encode("ascii"), float(value), ptype)
+            if echoed is None:
+                with lock:
+                    e = S["params"].get(name)
+                current = e["value"] if e else None
+                return {"ok": False,
+                        "message": f"{name} の書き込みを確認できませんでした"
+                                   f"（機体の現在値: {current}）",
+                        "value": current}
+            push_log(6, f"パラメータ書き込み: {name} = {echoed}")
+            return {"ok": True,
+                    "message": f"{name} を {echoed} に設定しました",
+                    "value": echoed}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"パラメータ書き込みに失敗: {e}",
+                    "value": None}
+        finally:
+            with lock:
+                S["paramBusy"] = False
+
+
+def cmd_params_list():
+    with lock:
+        params = [
+            {"name": n, "value": e["value"], "ptype": e["ptype"]}
+            for n, e in sorted(S["params"].items())
+        ]
+        return {"ok": True, "message": "", "state": S["paramState"],
+                "total": S["paramTotal"], "params": params}
+
+
 def cmd_mission_start(takeoff_alt):
     """Start the uploaded mission. Airborne: just engage AUTO. On the
     ground: ArduPilot refuses to arm in AUTO ("Auto mode not armable"),
@@ -822,6 +1030,8 @@ def snapshot():
         "joyEnabled": s["joyEnabled"], "joyStreaming": s["joyStreaming"],
         "joyUpdatedAgoMs": None if not s["joyUpdatedAt"] else int((time.time() - s["joyUpdatedAt"]) * 1000),
         "missionCurrent": s["missionCurrent"], "missionReached": s["missionReached"],
+        "paramState": s["paramState"], "paramCount": len(s["params"]),
+        "paramTotal": s["paramTotal"],
     }
 
 
@@ -842,6 +1052,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True})
         elif self.path == "/status":
             self._json(200, snapshot())
+        elif self.path == "/params/list":
+            self._json(200, cmd_params_list())
         else:
             self._json(404, {"ok": False, "message": "not found"})
 
@@ -877,6 +1089,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, cmd_mission_clear())
             elif self.path == "/mission/start":
                 self._json(200, cmd_mission_start(float(body.get("takeoffAltM", 10))))
+            elif self.path == "/params/fetch":
+                self._json(200, cmd_params_fetch())
+            elif self.path == "/params/set":
+                self._json(200, cmd_params_set(
+                    str(body.get("name", "")), float(body.get("value", 0))))
             else:
                 self._json(404, {"ok": False, "message": "not found"})
         except Exception as e:  # noqa: BLE001
