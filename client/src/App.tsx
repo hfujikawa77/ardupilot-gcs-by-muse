@@ -6,15 +6,42 @@ import { MapPanel, type LatLon } from "./MapPanel";
 import { Stick } from "./Joystick";
 
 type Status = ApiResponse<typeof api, "getStatus">;
-type TabId = "fly" | "goto" | "stick" | "telemetry" | "log";
+type TabId = "fly" | "mission" | "goto" | "stick" | "telemetry" | "log";
 
 const TABS: { id: TabId; label: string }[] = [
   { id: "fly", label: "飛行" },
+  { id: "mission", label: "ミッション" },
   { id: "goto", label: "Goto" },
   { id: "stick", label: "スティック" },
   { id: "telemetry", label: "テレメトリ" },
   { id: "log", label: "ログ・接続" },
 ];
+
+type MissionItemType = "takeoff" | "waypoint" | "land" | "rtl" | "other";
+interface MissionItemState {
+  id: number;
+  type: MissionItemType;
+  command?: number;
+  lat: number;
+  lon: number;
+  altM: number;
+}
+const MISSION_TYPE_LABELS: Record<MissionItemType, string> = {
+  takeoff: "離陸",
+  waypoint: "ウェイポイント",
+  land: "着陸",
+  rtl: "RTL（帰還）",
+  other: "その他",
+};
+// Compact labels for the one-line mission item row.
+const MISSION_TYPE_SHORT: Record<MissionItemType, string> = {
+  takeoff: "離陸",
+  waypoint: "WP",
+  land: "着陸",
+  rtl: "RTL",
+  other: "その他",
+};
+const MISSION_ALT_PRESETS = [3, 5, 10, 15, 20, 30, 50, 80];
 // Modes in which ArduCopter actually applies MANUAL_CONTROL / pilot
 // stick input. In GUIDED / AUTO / RTL / LAND etc. the vehicle flies its
 // own navigation and stick input is silently ignored — the classic
@@ -82,7 +109,7 @@ function SlideConfirm({
     const el = trackRef.current;
     if (!el) return;
     const rect = el.getBoundingClientRect();
-    const thumb = 38;
+    const thumb = 40;
     const travel = Math.max(1, rect.width - thumb);
     const f = Math.max(0, Math.min(1, (clientX - rect.left - thumb / 2) / travel));
     setFrac(f);
@@ -111,7 +138,7 @@ function SlideConfirm({
       <div
         className="absolute inset-y-0 left-0"
         style={{
-          width: `calc(38px + ${frac} * (100% - 38px))`,
+          width: `calc(40px + ${frac} * (100% - 40px))`,
           background: fired
             ? "rgba(61,220,132,0.25)"
             : danger ? "rgba(244,83,74,0.22)" : "rgba(34,211,238,0.16)",
@@ -119,7 +146,7 @@ function SlideConfirm({
         }}
       />
       <span
-        className="pointer-events-none absolute inset-0 flex items-center justify-center pl-[38px] text-xs font-bold tracking-wide"
+        className="pointer-events-none absolute inset-0 flex items-center justify-center pl-[40px] text-xs font-bold"
         style={{ color: fired ? "var(--ok)" : danger ? "#ff8d85" : "var(--text)" }}
       >
         {fired ? "送信しました" : label}
@@ -132,9 +159,9 @@ function SlideConfirm({
         aria-valuenow={Math.round(frac * 100)}
         aria-valuetext={fired ? "実行済み" : `スライド ${Math.round(frac * 100)}%`}
         tabIndex={disabled ? -1 : 0}
-        className="absolute inset-y-0 left-0 flex w-[38px] items-center justify-center rounded-lg text-base font-bold"
+        className="absolute inset-y-0 left-0 flex w-[40px] items-center justify-center rounded-lg text-base font-bold"
         style={{
-          left: `calc(${frac} * (100% - 38px))`,
+          left: `calc(${frac} * (100% - 40px))`,
           background: danger ? "rgba(244,83,74,0.85)" : "var(--accent)",
           color: "#0b1116",
           cursor: disabled ? "not-allowed" : "grab",
@@ -181,7 +208,7 @@ function Readout({ label, value, unit, accent, small }: {
 }) {
   return (
     <div className="rounded-lg px-2.5 py-2" style={{ background: "var(--surface-2)" }}>
-      <div className="text-[10px] tracking-widest" style={{ color: "var(--dim)" }}>{label}</div>
+      <div className="text-[10px]" style={{ color: "var(--dim)" }}>{label}</div>
       <div
         className={`mono leading-tight ${small ? "text-[13px]" : "text-lg"}`}
         style={{ color: accent ? "var(--accent)" : "var(--text)" }}
@@ -268,8 +295,24 @@ export function App() {
   const [gotoLon, setGotoLon] = useState("");
   const [gotoAlt, setGotoAlt] = useState("10");
   const [mapTarget, setMapTarget] = useState<LatLon | null>(null);
+
+  // ---- mission editor state ----
+  const [missionItems, setMissionItems] = useState<MissionItemState[]>([]);
+  const [missionSel, setMissionSel] = useState<number | null>(null);
+  const [missionMsg, setMissionMsg] = useState<string | null>(null);
+  const [missionBusy, setMissionBusy] = useState(false);
+  const [newWpAlt, setNewWpAlt] = useState("10");
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [aiBusy, setAiBusy] = useState(false);
+  const missionIdRef = useRef(1);
+  const tabRef = useRef<TabId>("fly");
+  tabRef.current = tab;
+  const newWpAltRef = useRef("10");
+  newWpAltRef.current = newWpAlt;
+
   const [recenterSignal, setRecenterSignal] = useState(0);
   const [hudOpen, setHudOpen] = useState(true);
+  const [panelOpen, setPanelOpen] = useState(true);
   const [tapReady, setTapReady] = useState(false);
 
   // ---- joystick state ----
@@ -463,13 +506,121 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [joyEnabled]);
 
-  // Map tap: set the Goto candidate pin and prefill the Goto inputs.
-  // The vehicle only moves after the explicit confirm in the Goto tab.
+  // ---- mission actions ----
+  const missionPayload = () =>
+    missionItems.map((it) => ({
+      type: it.type,
+      ...(it.type === "other" && it.command !== undefined ? { command: it.command } : {}),
+      lat: it.lat, lon: it.lon, altM: it.altM,
+    }));
+
+  const uploadMission = async () => {
+    if (missionItems.length === 0 || missionBusy) return;
+    setMissionBusy(true);
+    setMissionMsg("アップロード中…");
+    try {
+      const r = await api.uploadMission({ items: missionPayload() });
+      setMissionMsg(r.message);
+      setActionMsg(r.message);
+    } catch (e) {
+      setMissionMsg(`アップロードエラー: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    setMissionBusy(false);
+    void statusQ.refetch();
+  };
+
+  const downloadMission = async () => {
+    if (missionBusy) return;
+    setMissionBusy(true);
+    setMissionMsg("ダウンロード中…");
+    try {
+      const r = await api.downloadMission({});
+      setMissionMsg(r.message);
+      if (r.ok) {
+        setMissionItems(
+          r.items.map((it) => ({ id: missionIdRef.current++, ...it })),
+        );
+        setMissionSel(null);
+      }
+    } catch (e) {
+      setMissionMsg(`ダウンロードエラー: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    setMissionBusy(false);
+    void statusQ.refetch();
+  };
+
+  const generateMissionWithAi = async () => {
+    const prompt = aiPrompt.trim();
+    if (!prompt || aiBusy) return;
+    setAiBusy(true);
+    setMissionMsg("AIがミッションを作成中…");
+    try {
+      const r = await api.generateMission({
+        prompt,
+        homeLat: s?.homeLat ?? null,
+        homeLon: s?.homeLon ?? null,
+        vehicleLat: s?.lat ?? null,
+        vehicleLon: s?.lon ?? null,
+      });
+      setMissionMsg(r.message);
+      if (r.ok && r.items.length > 0) {
+        setMissionItems(
+          r.items.map((it) => ({ id: missionIdRef.current++, ...it })),
+        );
+        setMissionSel(null);
+      }
+    } catch (e) {
+      setMissionMsg(`AI生成エラー: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    setAiBusy(false);
+  };
+
+  const moveMissionItem = (index: number, dir: -1 | 1) => {
+    setMissionItems((items) => {
+      const j = index + dir;
+      if (j < 0 || j >= items.length) return items;
+      const next = [...items];
+      const a = next[index];
+      const b = next[j];
+      if (!a || !b) return items;
+      next[index] = b;
+      next[j] = a;
+      return next;
+    });
+    setMissionSel(index + dir);
+  };
+
+  // Map tap: in the mission tab it appends a waypoint; everywhere else
+  // it sets the Goto candidate pin and prefills the Goto inputs. The
+  // vehicle only moves after the explicit confirm in the Goto tab.
   const onMapTap = useCallback((p: LatLon) => {
+    if (tabRef.current === "mission") {
+      const alt = Number.parseInt(newWpAltRef.current, 10) || 10;
+      setMissionItems((items) => {
+        const item: MissionItemState = {
+          id: missionIdRef.current++,
+          type: "waypoint", lat: p.lat, lon: p.lon, altM: alt,
+        };
+        setMissionSel(items.length);
+        return [...items, item];
+      });
+      return;
+    }
     setMapTarget(p);
     setGotoLat(p.lat.toFixed(6));
     setGotoLon(p.lon.toFixed(6));
   }, []);
+
+  const onMissionPointMove = useCallback((index: number, p: LatLon) => {
+    setMissionItems((items) =>
+      items.map((it, i) => (i === index ? { ...it, lat: p.lat, lon: p.lon } : it)),
+    );
+  }, []);
+
+  const missionPoints = missionItems
+    .map((it, i) => ({ it, i }))
+    .filter(({ it }) => it.type !== "rtl")
+    .map(({ it, i }) => ({ index: i, lat: it.lat, lon: it.lon, label: String(i + 1) }));
 
   const vehicle: LatLon | null =
     s?.lat != null && s?.lon != null ? { lat: s.lat, lon: s.lon } : null;
@@ -506,7 +657,7 @@ export function App() {
             {s ? `${s.host}:${s.port}` : "—"}
           </span>
         </span>
-        <span className="mono text-xl font-bold tracking-wide sm:text-2xl" style={{ color: "var(--accent)" }}>
+        <span className="mono text-xl font-bold sm:text-2xl" style={{ color: "var(--accent)" }}>
           {s?.mode ?? "—"}
         </span>
         <span
@@ -539,7 +690,7 @@ export function App() {
           aria-live="off"
         >
           {dataStale
-            ? `⚠ 更新停止 ${Math.round((dataAgeMs ?? 0) / 1000)}秒`
+            ? `更新停止 ${Math.round((dataAgeMs ?? 0) / 1000)}秒`
             : `更新 ${updatedClock}`}
           {" · "}{s?.rxMsgCount ?? 0} msg
         </span>
@@ -598,36 +749,73 @@ export function App() {
             home={home} target={mapTarget} track={s?.track ?? []}
             recenterSignal={recenterSignal}
             onTap={onMapTap} onTapReady={setTapReady}
+            missionPoints={missionPoints}
+            missionSelected={missionSel}
+            onMissionPointMove={onMissionPointMove}
+            onMissionPointSelect={setMissionSel}
           />
 
-          {/* HUD overlay (QGC instrument panel) */}
+          {/* HUD overlay: the round gauge floats directly on the map —
+              no square panel behind it, so the map shows through the
+              corners. Only small circular / pill chips sit around it. */}
           <div className="absolute left-2 top-2">
             {hudOpen ? (
-              <div className="panel w-[168px] p-2 sm:w-[212px]" style={{ background: "rgba(16,26,33,0.92)" }}>
-                <div className="mb-0.5 flex items-center justify-between">
-                  <span className="panel-title">HUD / 姿勢</span>
+              <div className="relative w-[188px] sm:w-[204px]">
+                <div className="relative mx-auto w-[136px] sm:w-[160px]">
+                  <Hud rollDeg={s?.rollDeg ?? null} pitchDeg={s?.pitchDeg ?? null} />
                   <button
-                    type="button" className="btn !px-1.5 !py-0 text-[11px]"
+                    type="button"
                     aria-label="HUDを閉じる"
                     onClick={() => setHudOpen(false)}
+                    className="absolute -right-1 top-0 flex h-6 w-6 items-center justify-center rounded-full text-[13px] leading-none"
+                    style={{
+                      background: "rgba(11,17,22,0.85)", color: "var(--dim)",
+                      border: "1px solid rgba(219,231,238,0.3)",
+                    }}
                   >
                     －
                   </button>
                 </div>
-                <Hud rollDeg={s?.rollDeg ?? null} pitchDeg={s?.pitchDeg ?? null} headingDeg={s?.headingDeg ?? null} />
-                <div className="mono mt-0.5 flex justify-between text-[10px] sm:text-[11px]" style={{ color: "var(--dim)" }}>
-                  <span>ALT {fmt(s?.altRelM ?? null)}m</span>
-                  <span>GS {fmt(s?.groundspeedMs ?? null)}m/s</span>
-                  <span>THR {fmt(s?.throttlePct ?? null, 0)}%</span>
+                <div className="mt-1.5 flex flex-wrap justify-center gap-1">
+                  <span
+                    className="mono whitespace-nowrap rounded-full px-2 py-0.5 text-[11px]"
+                    style={{ background: "rgba(11,17,22,0.82)", color: "var(--accent)", border: "1px solid rgba(219,231,238,0.18)" }}
+                  >
+                    HDG {s?.headingDeg != null ? `${String(Math.round(s.headingDeg)).padStart(3, "0")}°` : "—"}
+                  </span>
+                  <span
+                    className="mono whitespace-nowrap rounded-full px-2 py-0.5 text-[11px]"
+                    style={{ background: "rgba(11,17,22,0.82)", color: "var(--text)", border: "1px solid rgba(219,231,238,0.18)" }}
+                  >
+                    ALT {fmt(s?.altRelM ?? null)}m
+                  </span>
+                  <span
+                    className="mono whitespace-nowrap rounded-full px-2 py-0.5 text-[11px]"
+                    style={{ background: "rgba(11,17,22,0.82)", color: "var(--text)", border: "1px solid rgba(219,231,238,0.18)" }}
+                  >
+                    GS {fmt(s?.groundspeedMs ?? null)}m/s
+                  </span>
+                  <span
+                    className="mono whitespace-nowrap rounded-full px-2 py-0.5 text-[11px]"
+                    style={{ background: "rgba(11,17,22,0.82)", color: "var(--text)", border: "1px solid rgba(219,231,238,0.18)" }}
+                  >
+                    THR {fmt(s?.throttlePct ?? null, 0)}%
+                  </span>
                 </div>
               </div>
             ) : (
               <button
-                type="button" className="btn text-xs"
+                type="button"
                 aria-label="HUDを開く"
                 onClick={() => setHudOpen(true)}
+                className="flex h-11 w-11 items-center justify-center rounded-full text-[10px] font-bold"
+                style={{
+                  background: "rgba(11,17,22,0.85)", color: "var(--accent)",
+                  border: "1px solid var(--accent)",
+                  boxShadow: "0 4px 14px rgba(0,0,0,0.5)",
+                }}
               >
-                HUD / 姿勢
+                HUD
               </button>
             )}
           </div>
@@ -642,12 +830,16 @@ export function App() {
             >
               機体にセンタリング
             </button>
-            <span
-              className="mono rounded px-1.5 py-0.5 text-[10px]"
-              style={{ background: "rgba(11,17,22,0.8)", color: "var(--dim)" }}
-            >
-              {tapReady ? "マップをタップで目標を設定" : "タップ指定は準備中"}
-            </span>
+            {tapReady && (
+              <span
+                className="mono rounded px-1.5 py-0.5 text-[10px]"
+                style={{ background: "rgba(11,17,22,0.8)", color: "var(--dim)" }}
+              >
+                {tab === "mission"
+                  ? "マップをタップでウェイポイント追加・ピンはドラッグで移動"
+                  : "マップをタップで目標を設定"}
+              </span>
+            )}
           </div>
 
           {/* bottom-center chip stack: stick-mode warning + tapped target */}
@@ -685,7 +877,9 @@ export function App() {
                   aria-label="目標ピンを消す"
                   onClick={() => setMapTarget(null)}
                 >
-                  ✕
+                  <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true" className="block">
+                    <path d="M1 1 L9 9 M9 1 L1 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                  </svg>
                 </button>
               </div>
             )}
@@ -718,9 +912,25 @@ export function App() {
           )}
         </div>
 
-        {/* tabbed side panel */}
-        <div className="panel flex h-[288px] shrink-0 flex-col overflow-hidden sm:h-[300px] lg:h-auto">
-          <div className="flex shrink-0" role="tablist" aria-label="GCSパネル切替" style={{ borderBottom: "1px solid var(--border)" }}>
+        {/* tabbed side panel — collapsible so the map can take the space */}
+        {!panelOpen ? (
+          <div className="panel flex shrink-0 items-center gap-2 px-3 py-2 lg:self-start">
+            <span className="panel-title">操作パネル</span>
+            <span className="mono truncate text-[11px]" style={{ color: "var(--dim)" }}>
+              {TABS.find((t) => t.id === tab)?.label}
+            </span>
+            <button
+              type="button" className="btn active ml-auto !px-2.5 !py-1 text-xs"
+              aria-label="操作パネルを開く"
+              aria-expanded={false}
+              onClick={() => setPanelOpen(true)}
+            >
+              開く ▴
+            </button>
+          </div>
+        ) : (
+        <div className="panel flex h-[252px] shrink-0 flex-col overflow-hidden sm:h-[264px] lg:h-auto">
+          <div className="flex shrink-0 items-stretch" role="tablist" aria-label="GCSパネル切替" style={{ borderBottom: "1px solid var(--border)" }}>
             {TABS.map((t) => (
               <button
                 key={t.id} type="button" role="tab"
@@ -731,6 +941,16 @@ export function App() {
                 {t.label}
               </button>
             ))}
+            <button
+              type="button"
+              aria-label="操作パネルを畳んで地図を広げる"
+              aria-expanded={true}
+              onClick={() => setPanelOpen(false)}
+              className="shrink-0 px-2.5 text-sm"
+              style={{ color: "var(--dim)", background: "transparent", border: "none", cursor: "pointer" }}
+            >
+              ▾
+            </button>
           </div>
 
           <div className="min-h-0 flex-1 overflow-y-auto p-3" role="tabpanel">
@@ -740,7 +960,7 @@ export function App() {
                   <label className="panel-title mb-1.5 block" htmlFor="mode-select">フライトモード</label>
                   <select
                     id="mode-select"
-                    className="inp mono"
+                    className="inp mono w-full"
                     aria-label="フライトモード選択"
                     value={s?.mode ?? ""}
                     disabled={!connected || modeSelectOptions.length === 0}
@@ -794,7 +1014,7 @@ export function App() {
                   <label className="mt-2 block">
                     <span className="text-xs" style={{ color: "var(--dim)" }}>離陸高度</span>
                     <select
-                      className="inp mono mt-0.5" value={takeoffAlt}
+                      className="inp mono mt-0.5 w-full" value={takeoffAlt}
                       aria-label="離陸高度"
                       onChange={(e) => setTakeoffAlt(e.target.value)}
                     >
@@ -815,6 +1035,273 @@ export function App() {
               </div>
             )}
 
+            {tab === "mission" && (
+              <div className="flex flex-col gap-3">
+                <p className="text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+                  マップをタップするとウェイポイントが追加され、黄ピンはドラッグで移動できます。
+                  並べたミッションは「アップロード」で機体に送られ、AUTOモードで実行されます（アップロードだけでは飛びません）。
+                </p>
+
+                {/* AI mission drafting */}
+                <div>
+                  <label className="panel-title mb-1.5 block" htmlFor="ai-mission-prompt">AIでミッションを作成</label>
+                  <textarea
+                    id="ai-mission-prompt"
+                    className="inp w-full"
+                    rows={2}
+                    value={aiPrompt}
+                    placeholder="例: ホームの周りを半径40mの四角形で一周、高度15m。最後はホームに戻って着陸"
+                    aria-label="AIへのミッション指示"
+                    onChange={(e) => setAiPrompt(e.target.value)}
+                  />
+                  <button
+                    type="button" className="btn active mt-1.5 w-full"
+                    disabled={aiBusy || aiPrompt.trim() === ""}
+                    onClick={() => void generateMissionWithAi()}
+                  >
+                    {aiBusy ? "AI作成中…" : "AIで作成してリストに入れる"}
+                  </button>
+                  <p className="mt-1 text-[11px]" style={{ color: "var(--dim)" }}>
+                    作成結果は下のリストに入ります。内容を確認・編集してからアップロードしてください。
+                  </p>
+                </div>
+
+                {/* add-waypoint defaults + quick add */}
+                <div className="flex flex-wrap items-end gap-2">
+                  <label className="block">
+                    <span className="text-xs" style={{ color: "var(--dim)" }}>追加するウェイポイントの高度</span>
+                    <select
+                      className="inp mono mt-0.5" value={newWpAlt}
+                      aria-label="追加するウェイポイントの高度"
+                      onChange={(e) => setNewWpAlt(e.target.value)}
+                    >
+                      {MISSION_ALT_PRESETS.map((a) => (
+                        <option key={a} value={String(a)}>{a} m</option>
+                      ))}
+                    </select>
+                  </label>
+                  <button
+                    type="button" className="btn" disabled={!home && !vehicle}
+                    onClick={() => {
+                      const base = home ?? vehicle;
+                      if (!base) return;
+                      const alt = Number.parseInt(newWpAlt, 10) || 10;
+                      setMissionItems((items) => [
+                        ...items,
+                        { id: missionIdRef.current++, type: "takeoff", lat: base.lat, lon: base.lon, altM: alt },
+                      ]);
+                    }}
+                  >
+                    離陸を追加
+                  </button>
+                  <button
+                    type="button" className="btn" disabled={!home && !vehicle}
+                    onClick={() => {
+                      const base = home ?? vehicle;
+                      if (!base) return;
+                      setMissionItems((items) => [
+                        ...items,
+                        { id: missionIdRef.current++, type: "land", lat: base.lat, lon: base.lon, altM: 0 },
+                      ]);
+                    }}
+                  >
+                    着陸を追加
+                  </button>
+                  <button
+                    type="button" className="btn"
+                    onClick={() => {
+                      const base = home ?? vehicle;
+                      setMissionItems((items) => [
+                        ...items,
+                        {
+                          id: missionIdRef.current++, type: "rtl",
+                          lat: base?.lat ?? 0, lon: base?.lon ?? 0, altM: 0,
+                        },
+                      ]);
+                    }}
+                  >
+                    RTLを追加
+                  </button>
+                </div>
+
+                {/* item list */}
+                <div>
+                  <div className="panel-title mb-1.5">
+                    ミッション項目（{missionItems.length}件）
+                  </div>
+                  {missionItems.length === 0 && (
+                    <p className="text-xs" style={{ color: "var(--dim)" }}>
+                      まだ項目がありません。マップをタップするか、AIで作成してください。機体に保存済みのミッションは「ダウンロード」で読み込めます。
+                    </p>
+                  )}
+                  <div className="flex flex-col gap-1">
+                    {missionItems.map((it, i) => {
+                      const selected = missionSel === i;
+                      return (
+                        <div
+                          key={it.id}
+                          className="flex items-center gap-1 rounded-lg px-1.5 py-1"
+                          style={{
+                            background: "var(--surface-2)",
+                            border: `1px solid ${selected ? "var(--warn)" : "var(--border)"}`,
+                          }}
+                          onClick={() => setMissionSel(i)}
+                        >
+                            <span
+                              className="mono order-1 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-bold"
+                              style={{ background: "rgba(245,184,61,0.92)", color: "#0b1116" }}
+                            >
+                              {i + 1}
+                            </span>
+                            <select
+                              className="inp mono order-2 !h-[26px] w-[74px] shrink-0 !px-1.5 !py-0 text-[11px]"
+                              value={it.type}
+                              aria-label={`項目${i + 1}の種類`}
+                              onChange={(e) => {
+                                const t = e.target.value as MissionItemType;
+                                setMissionItems((items) =>
+                                  items.map((x, xi) => (xi === i ? { ...x, type: t } : x)),
+                                );
+                              }}
+                            >
+                              {(Object.keys(MISSION_TYPE_LABELS) as MissionItemType[])
+                                .filter((t) => t !== "other" || it.type === "other")
+                                .map((t) => (
+                                  <option key={t} value={t}>
+                                    {t === "other" && it.command !== undefined
+                                      ? `その他 (CMD ${it.command})`
+                                      : MISSION_TYPE_SHORT[t]}
+                                  </option>
+                                ))}
+                            </select>
+                            <button
+                              type="button" className="btn order-4 w-[22px] shrink-0 !px-0 !py-1 text-center text-[11px]"
+                              aria-label={`項目${i + 1}を上へ`}
+                              disabled={i === 0}
+                              onClick={(e) => { e.stopPropagation(); moveMissionItem(i, -1); }}
+                            >
+                              ↑
+                            </button>
+                            <button
+                              type="button" className="btn order-4 w-[22px] shrink-0 !px-0 !py-1 text-center text-[11px]"
+                              aria-label={`項目${i + 1}を下へ`}
+                              disabled={i === missionItems.length - 1}
+                              onClick={(e) => { e.stopPropagation(); moveMissionItem(i, 1); }}
+                            >
+                              ↓
+                            </button>
+                            <button
+                              type="button" className="btn order-4 w-[22px] shrink-0 !px-0 !py-1 text-center text-[11px]"
+                              aria-label={`項目${i + 1}を削除`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setMissionItems((items) => items.filter((_, xi) => xi !== i));
+                                setMissionSel(null);
+                              }}
+                            >
+                              ×
+                            </button>
+                          <div className="order-3 flex min-w-0 flex-1 items-center gap-1.5">
+                            {it.type !== "rtl" && (
+                              <span
+                                className="mono min-w-0 flex-1 truncate text-[10px]"
+                                style={{ color: "var(--dim)" }}
+                                title={`${it.lat.toFixed(6)}, ${it.lon.toFixed(6)}`}
+                              >
+                                {it.lat.toFixed(5)}, {it.lon.toFixed(5)}
+                              </span>
+                            )}
+                            {it.type === "takeoff" || it.type === "waypoint" || it.type === "other" ? (
+                              <label className="flex shrink-0 items-center">
+                                <select
+                                  className="inp mono !h-[26px] !w-[62px] !px-1 !py-0 text-[11px]"
+                                  value={String(it.altM)}
+                                  aria-label={`項目${i + 1}の高度`}
+                                  onChange={(e) => {
+                                    const v = Number.parseInt(e.target.value, 10) || 0;
+                                    setMissionItems((items) =>
+                                      items.map((x, xi) => (xi === i ? { ...x, altM: v } : x)),
+                                    );
+                                  }}
+                                >
+                                  {[...new Set([it.altM, ...MISSION_ALT_PRESETS])].sort((a, b) => a - b).map((a) => (
+                                    <option key={a} value={String(a)}>{a} m</option>
+                                  ))}
+                                </select>
+                              </label>
+                            ) : it.type === "land" ? (
+                              <span className="mono shrink-0 text-[10px]" style={{ color: "var(--dim)" }} title="高度 0 m（着陸）">0 m</span>
+                            ) : (
+                              <span className="min-w-0 flex-1 truncate text-[11px]" style={{ color: "var(--dim)" }}>ホームへ帰還</span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* transfer + execute */}
+                <div className="flex flex-col gap-2">
+                  <button
+                    type="button" className="btn active"
+                    disabled={!connected || missionItems.length === 0 || missionBusy}
+                    onClick={() => void uploadMission()}
+                  >
+                    {missionBusy ? "転送中…" : `ミッションをアップロード（${missionItems.length}件）`}
+                  </button>
+                  <div className="flex flex-wrap gap-1.5">
+                    <button
+                      type="button" className="btn flex-1"
+                      disabled={!connected || missionBusy}
+                      onClick={() => void downloadMission()}
+                    >
+                      ダウンロード
+                    </button>
+                    <button
+                      type="button" className="btn flex-1"
+                      disabled={missionItems.length === 0}
+                      onClick={() => { setMissionItems([]); setMissionSel(null); }}
+                    >
+                      編集をクリア
+                    </button>
+                    <button
+                      type="button" className="btn flex-1"
+                      disabled={!connected || missionBusy}
+                      onClick={() => void run(() => api.clearMission({}))}
+                    >
+                      機体のミッション消去
+                    </button>
+                  </div>
+                  <SlideConfirm
+                    label="ミッション開始"
+                    ariaLabel="ミッション開始: 右端までスライドで実行"
+                    disabled={!connected}
+                    onConfirm={() => {
+                      const tk = missionItems.find((it) => it.type === "takeoff");
+                      void run(() =>
+                        api.startMission({ takeoffAltM: tk ? tk.altM : 10 }),
+                      );
+                    }}
+                  />
+                  <p className="text-[11px]" style={{ color: "var(--dim)" }}>
+                    地上ではGUIDEDで離陸アイテムの高度まで上がってからAUTOに移ります（AUTOのままではアームできず、地上発進はスロットル操作待ちになるため）。
+                  </p>
+                  {s?.missionCurrent != null && s.missionCurrent > 0 && (
+                    <div className="mono text-xs" style={{ color: "var(--dim)" }}>
+                      機体の実行位置: 項目 {s.missionCurrent}
+                      {s.missionReached != null && s.missionReached > 0 && ` / 到達済み ${s.missionReached}`}
+                    </div>
+                  )}
+                  {missionMsg && (
+                    <div className="mono text-xs leading-relaxed" style={{ color: "var(--accent)" }}>
+                      {missionMsg}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
             {tab === "goto" && (
               <div className="flex flex-col gap-3">
                 <p className="text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
@@ -824,19 +1311,19 @@ export function App() {
                 <div className="grid grid-cols-2 gap-2">
                   <label className="block">
                     <span className="text-xs" style={{ color: "var(--dim)" }}>緯度</span>
-                    <input className="inp mono mt-0.5" value={gotoLat} inputMode="decimal"
+                    <input className="inp mono mt-0.5 w-full" value={gotoLat} inputMode="decimal"
                       onChange={(e) => setGotoLat(e.target.value)} aria-label="目標の緯度" placeholder="-35.363262" />
                   </label>
                   <label className="block">
                     <span className="text-xs" style={{ color: "var(--dim)" }}>経度</span>
-                    <input className="inp mono mt-0.5" value={gotoLon} inputMode="decimal"
+                    <input className="inp mono mt-0.5 w-full" value={gotoLon} inputMode="decimal"
                       onChange={(e) => setGotoLon(e.target.value)} aria-label="目標の経度" placeholder="149.165237" />
                   </label>
                 </div>
                 <label className="block">
                   <span className="text-xs" style={{ color: "var(--dim)" }}>高度</span>
                   <select
-                    className="inp mono mt-0.5" value={gotoAlt}
+                    className="inp mono mt-0.5 w-full" value={gotoAlt}
                     aria-label="目標の高度"
                     onChange={(e) => setGotoAlt(e.target.value)}
                   >
@@ -1065,7 +1552,7 @@ export function App() {
                   <div className="panel-title mb-1.5">機体メッセージ</div>
                   <div className="flex flex-col gap-1">
                     {(s?.messages ?? []).length === 0 && (
-                      <span className="text-xs" style={{ color: "var(--dim)" }}>メッセージはまだありません</span>
+                      <span className="text-xs" style={{ color: "var(--dim)" }}>機体からのメッセージはまだ届いていません</span>
                     )}
                     {(s?.messages ?? []).map((m, i) => (
                       <div key={`${m.at}-${i}`} className="mono flex gap-2 text-xs leading-relaxed">
@@ -1089,6 +1576,7 @@ export function App() {
             )}
           </div>
         </div>
+        )}
       </div>
 
       {/* ------- bottom strip: latest message ------- */}
@@ -1097,7 +1585,7 @@ export function App() {
         <span className="mono truncate text-[11px] sm:text-xs" style={{ color: "var(--dim)" }}>
           {lastMsg
             ? `${new Date(lastMsg.at).toLocaleTimeString("ja-JP")}  ${lastMsg.text}`
-            : actionMsg ?? "メッセージはまだありません"}
+            : actionMsg ?? ""}
         </span>
         {s?.conn !== "connected" && s?.lastError && (
           <span className="mono ml-auto hidden shrink-0 truncate text-[11px] md:inline" style={{ color: "var(--warn)" }}>

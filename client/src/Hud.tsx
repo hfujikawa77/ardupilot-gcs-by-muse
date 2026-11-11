@@ -1,39 +1,46 @@
-// Artificial horizon + heading display, drawn as SVG from live ATTITUDE /
-// GLOBAL_POSITION_INT telemetry. Pure presentation: all values come from
-// the server snapshot.
+// Round artificial horizon, drawn as SVG from live ATTITUDE telemetry.
+// The instrument is a circular gauge (like a classic attitude
+// indicator): the sky/ground ball, pitch ladder and roll pointer live
+// inside the circle and the roll scale runs around its rim. The SVG is
+// exactly the circle (plus a soft backing disc) so it can float on the
+// map with no square panel behind it; the heading and numeric readouts
+// live in HTML chips next to it in App.tsx.
+// Pure presentation: all values come from the server snapshot.
 
 interface HudProps {
   rollDeg: number | null;
   pitchDeg: number | null;
-  headingDeg: number | null;
 }
 
 const CX = 160;
-const CY = 150;
+const CY = 126;
+const R = 114;
 const PX_PER_DEG = 2.4;
 
-export function Hud({ rollDeg, pitchDeg, headingDeg }: HudProps) {
+export function Hud({ rollDeg, pitchDeg }: HudProps) {
   const roll = rollDeg ?? 0;
   const pitch = pitchDeg ?? 0;
   const pitchPx = Math.max(-55, Math.min(55, pitch)) * PX_PER_DEG;
-  const hdg = headingDeg ?? 0;
 
   const ladder = [-30, -20, -10, 10, 20, 30];
-  // Heading tape: ticks every 10 degrees within +-40 of current heading.
-  const tapeTicks: { deg: number; off: number }[] = [];
-  for (let d = -40; d <= 40; d += 10) {
-    const deg = ((Math.round(hdg / 10) * 10 + d) % 360 + 360) % 360;
-    const off = ((((deg - hdg) % 360) + 540) % 360) - 180;
-    if (Math.abs(off) <= 42) tapeTicks.push({ deg, off });
-  }
 
   return (
-    <svg viewBox="0 0 320 300" className="w-full" role="img" aria-label="姿勢表示器">
+    <svg
+      viewBox="0 0 320 252"
+      className="w-full"
+      role="img"
+      aria-label="姿勢表示器"
+      style={{ filter: "drop-shadow(0 6px 16px rgba(0,0,0,0.6))", display: "block" }}
+    >
       <defs>
         <clipPath id="hud-clip">
-          <rect x="6" y="6" width="308" height="248" rx="10" />
+          <circle cx={CX} cy={CY} r={R} />
         </clipPath>
       </defs>
+      {/* soft circular backing so the gauge reads against any map tile —
+          a disc, never a square panel */}
+      <circle cx={CX} cy={CY} r={R + 7} fill="rgba(11,17,22,0.45)" />
+      <circle cx={CX} cy={CY} r={R + 7} fill="none" stroke="rgba(219,231,238,0.22)" strokeWidth="1" />
       <g clipPath="url(#hud-clip)">
         {/* rotating / pitching world */}
         <g transform={`rotate(${(-roll).toFixed(2)} ${CX} ${CY})`}>
@@ -65,11 +72,11 @@ export function Hud({ rollDeg, pitchDeg, headingDeg }: HudProps) {
             })}
           </g>
         </g>
-        {/* roll scale (fixed) */}
+        {/* roll scale (fixed, around the rim) */}
         {[-60, -45, -30, -15, 0, 15, 30, 45, 60].map((a) => {
           const rad = ((a - 90) * Math.PI) / 180;
-          const r1 = 118;
-          const r2 = a % 30 === 0 ? 104 : 110;
+          const r1 = R - 3;
+          const r2 = a % 30 === 0 ? R - 17 : R - 11;
           return (
             <line
               key={a}
@@ -82,7 +89,7 @@ export function Hud({ rollDeg, pitchDeg, headingDeg }: HudProps) {
         {/* roll pointer (rotates with the aircraft) */}
         <g transform={`rotate(${(-roll).toFixed(2)} ${CX} ${CY})`}>
           <polygon
-            points={`${CX},${CY - 100} ${CX - 6},${CY - 88} ${CX + 6},${CY - 88}`}
+            points={`${CX},${CY - R + 22} ${CX - 6},${CY - R + 34} ${CX + 6},${CY - R + 34}`}
             fill="#22d3ee"
           />
         </g>
@@ -94,27 +101,10 @@ export function Hud({ rollDeg, pitchDeg, headingDeg }: HudProps) {
           <line x1={CX + 16} y1={CY} x2={CX + 16} y2={CY + 8} />
         </g>
         <circle cx={CX} cy={CY} r="3.5" fill="#22d3ee" />
-        <rect x="6" y="6" width="308" height="248" rx="10" fill="none" stroke="#1f303d" strokeWidth="2" />
       </g>
-      {/* heading tape */}
-      <g>
-        <rect x="6" y="262" width="308" height="32" rx="8" fill="#0d151c" stroke="#1f303d" />
-        {tapeTicks.map(({ deg, off }) => {
-          const x = CX + off * 2.6;
-          return (
-            <g key={deg}>
-              <line x1={x} y1="268" x2={x} y2="276" stroke="#8fa6b3" strokeWidth="1.4" />
-              <text x={x} y="290" textAnchor="middle" fontSize="10" fill="#8fa6b3" className="mono">
-                {String(deg).padStart(3, "0")}
-              </text>
-            </g>
-          );
-        })}
-        <polygon points={`${CX},274 ${CX - 5},266 ${CX + 5},266`} fill="#22d3ee" />
-        <text x={CX} y="258" textAnchor="middle" fontSize="12" fill="#22d3ee" className="mono">
-          HDG {String(Math.round(hdg)).padStart(3, "0")}°
-        </text>
-      </g>
+      {/* bezel */}
+      <circle cx={CX} cy={CY} r={R} fill="none" stroke="#1f303d" strokeWidth="3" />
+      <circle cx={CX} cy={CY} r={R + 4} fill="none" stroke="#1f303d" strokeWidth="1" opacity="0.6" />
     </svg>
   );
 }

@@ -88,7 +88,7 @@ export const privileged = definePrivilegedContracts({
     request: z.object({
       method: z.enum(["GET", "POST"]),
       path: z.string().min(1).max(64),
-      body: z.string().max(4096),
+      body: z.string().max(32768),
     }),
     response: z.object({ status: z.number(), body: z.string() }),
     timeoutMs: 30000,

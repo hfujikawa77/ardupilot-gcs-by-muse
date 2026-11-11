@@ -44,6 +44,10 @@ ACK_RESULT_TEXT = {
 COMMAND_NAME = {400: "ARM_DISARM", 22: "NAV_TAKEOFF", 21: "NAV_LAND", 20: "NAV_RTL"}
 MAV_CMD_COMPONENT_ARM_DISARM = 400
 MAV_CMD_NAV_TAKEOFF = 22
+# Mission item types the GCS editor understands, mapped to MAV_CMD ids.
+MISSION_TYPE_TO_CMD = {"waypoint": 16, "rtl": 20, "land": 21, "takeoff": 22}
+MISSION_CMD_TO_TYPE = {v: k for k, v in MISSION_TYPE_TO_CMD.items()}
+MAV_MISSION_ACCEPTED = 0
 GOTO_MASK = (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 8) | (1 << 10) | (1 << 11)
 NEUTRAL = {"pitch": 0.0, "roll": 0.0, "yaw": 0.0, "throttle": 0.5}
 
@@ -66,7 +70,12 @@ S = {
     "track": [], "messages": [], "acks": [],
     "joyEnabled": False, "joyAxes": dict(NEUTRAL), "joyUpdatedAt": 0.0,
     "joyStreaming": False, "sitlPid": None,
+    # Mission transfer state: while missionBusy is set, mav_loop parks
+    # its receiver so the transfer thread owns the socket reads.
+    "missionBusy": False, "missionCurrent": None, "missionReached": None,
 }
+
+mission_lock = threading.Lock()
 
 
 def now_iso():
@@ -187,6 +196,10 @@ def dispatch(msg):
                 S["messages"].insert(
                     0, {"at": now_iso(), "severity": msg.severity, "text": text})
                 del S["messages"][100:]
+        elif t == "MISSION_CURRENT":
+            S["missionCurrent"] = msg.seq
+        elif t == "MISSION_ITEM_REACHED":
+            S["missionReached"] = msg.seq
         elif t == "COMMAND_ACK":
             S["acks"].insert(0, {
                 "at": now_iso(), "command": msg.command,
@@ -239,6 +252,12 @@ def mav_loop():
                 with lock:
                     if not S["wantConnected"]:
                         break
+                    busy = S["missionBusy"]
+                if busy:
+                    # A mission transfer owns the socket reads; park
+                    # here (it dispatches telemetry it receives itself).
+                    time.sleep(0.05)
+                    continue
                 msg = mav.recv_match(blocking=True, timeout=0.25)
                 if msg is not None:
                     dispatch(msg)
@@ -392,6 +411,325 @@ def cmd_goto(lat, lon, alt_m):
     return {"ok": True, "message": "目標地点への移動を送信しました"}
 
 
+# ---- mission transfer (MAVLink mission protocol) ----
+# Upload/download/clear run in the HTTP handler thread while mav_loop is
+# parked via S["missionBusy"], so this thread is the only socket reader.
+# Non-mission messages received mid-transfer are dispatched normally, so
+# the telemetry snapshot stays alive, and a GCS heartbeat is sent every
+# second so the vehicle's GCS failsafe cannot trip during a transfer.
+
+MISSION_XFER_TYPES = (
+    "MISSION_REQUEST", "MISSION_REQUEST_INT", "MISSION_ACK",
+    "MISSION_COUNT", "MISSION_ITEM_INT", "MISSION_ITEM",
+)
+
+
+def _xfer_recv(mav, state, wait_s):
+    """Wait up to wait_s for one mission-protocol message, dispatching
+    everything else. Sends the periodic GCS heartbeat. Returns the
+    message or None."""
+    deadline = time.time() + wait_s
+    while time.time() < deadline:
+        if time.time() - state["lastHb"] > 1.0:
+            state["lastHb"] = time.time()
+            with mav_lock:
+                mav.mav.heartbeat_send(
+                    mavutil.mavlink.MAV_TYPE_GCS,
+                    mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+        msg = mav.recv_match(blocking=True, timeout=0.4)
+        if msg is None:
+            continue
+        t = msg.get_type()
+        if t in MISSION_XFER_TYPES:
+            return msg
+        dispatch(msg)
+    return None
+
+
+def _send_mission_item(mav, seq, item):
+    typ = item.get("type")
+    if typ == "other":
+        cmd = int(item.get("command") or 16)
+    else:
+        cmd = MISSION_TYPE_TO_CMD.get(typ, 16)
+    lat = float(item.get("lat") or 0)
+    lon = float(item.get("lon") or 0)
+    alt = float(item.get("altM") or 0)
+    with mav_lock:
+        mav.mav.mission_item_int_send(
+            mav.target_system, mav.target_component, seq,
+            mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+            cmd, 1 if seq == 0 else 0, 1,
+            0, 0, 0, 0,
+            int(round(lat * 1e7)), int(round(lon * 1e7)), float(alt),
+            mavutil.mavlink.MAV_MISSION_TYPE_MISSION)
+
+
+def cmd_mission_upload(items):
+    mav = get_mav()
+    if mav is None:
+        return {"ok": False, "message": "未接続のためミッションをアップロードできません"}
+    if not items:
+        return {"ok": False, "message": "ミッションが空です"}
+    if len(items) > 100:
+        return {"ok": False, "message": "ミッションは100件までです"}
+    # ArduPilot reserves mission seq 0 for the home position: an item
+    # uploaded at seq 0 is swallowed as the home slot and never flown
+    # (verified live: a takeoff uploaded at seq 0 came back on download
+    # as a dummy waypoint at 0,0). Like Mission Planner, prepend the
+    # home placeholder so the editor's first item lands at seq 1.
+    with lock:
+        home_lat = S["homeLat"] if S["homeLat"] is not None else S["lat"]
+        home_lon = S["homeLon"] if S["homeLon"] is not None else S["lon"]
+    home_item = {
+        "type": "waypoint",
+        "lat": home_lat or 0, "lon": home_lon or 0, "altM": 0,
+    }
+    items = [home_item, *items]
+    with mission_lock:
+        with lock:
+            S["missionBusy"] = True
+        try:
+            time.sleep(0.3)  # let mav_loop park its receiver
+            ts, tc = mav.target_system, mav.target_component
+            mmt = mavutil.mavlink.MAV_MISSION_TYPE_MISSION
+            state = {"lastHb": 0.0}
+            deadline = time.time() + 20
+            sent_max = -1
+            count_at = time.time()
+            with mav_lock:
+                mav.mav.mission_count_send(ts, tc, len(items), mmt)
+            while time.time() < deadline:
+                if sent_max < len(items) - 1 and time.time() - count_at > 4:
+                    # No request progress (a request may have been lost
+                    # to the receiver handover): restart the transfer.
+                    with mav_lock:
+                        mav.mav.mission_count_send(ts, tc, len(items), mmt)
+                    count_at = time.time()
+                    sent_max = -1
+                msg = _xfer_recv(mav, state, 1.5)
+                if msg is None:
+                    continue
+                t = msg.get_type()
+                if t in ("MISSION_REQUEST", "MISSION_REQUEST_INT"):
+                    seq = int(msg.seq)
+                    if 0 <= seq < len(items):
+                        _send_mission_item(mav, seq, items[seq])
+                        sent_max = max(sent_max, seq)
+                elif t == "MISSION_ACK":
+                    result = int(msg.type)
+                    if result == MAV_MISSION_ACCEPTED:
+                        push_log(6, f"ミッションをアップロードしました ({len(items) - 1}件)")
+                        return {"ok": True,
+                                "message": f"ミッションをアップロードしました（{len(items) - 1}件）"}
+                    return {"ok": False,
+                            "message": f"機体がミッションを拒否しました (MAV_MISSION_RESULT {result})"}
+            return {"ok": False, "message": "ミッションのアップロードがタイムアウトしました"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"ミッションのアップロードに失敗: {e}"}
+        finally:
+            with lock:
+                S["missionBusy"] = False
+
+
+def cmd_mission_download():
+    mav = get_mav()
+    if mav is None:
+        return {"ok": False, "message": "未接続のためミッションをダウンロードできません", "items": []}
+    with mission_lock:
+        with lock:
+            S["missionBusy"] = True
+        try:
+            time.sleep(0.3)
+            ts, tc = mav.target_system, mav.target_component
+            mmt = mavutil.mavlink.MAV_MISSION_TYPE_MISSION
+            state = {"lastHb": 0.0}
+            count = None
+            deadline = time.time() + 15
+            list_at = 0.0
+            while time.time() < deadline and count is None:
+                if time.time() - list_at > 3:
+                    list_at = time.time()
+                    with mav_lock:
+                        mav.mav.mission_request_list_send(ts, tc, mmt)
+                msg = _xfer_recv(mav, state, 1.5)
+                if msg is not None and msg.get_type() == "MISSION_COUNT":
+                    count = int(msg.count)
+            if count is None:
+                return {"ok": False, "message": "機体からミッション件数が返りませんでした", "items": []}
+            items = []
+            for seq in range(count):
+                got = None
+                item_deadline = time.time() + 8
+                req_at = 0.0
+                while time.time() < item_deadline and got is None:
+                    if time.time() - req_at > 2.5:
+                        req_at = time.time()
+                        with mav_lock:
+                            mav.mav.mission_request_int_send(ts, tc, seq, mmt)
+                    msg = _xfer_recv(mav, state, 1.5)
+                    if msg is not None and msg.get_type() in ("MISSION_ITEM_INT", "MISSION_ITEM"):
+                        if int(msg.seq) == seq:
+                            got = msg
+                if got is None:
+                    return {"ok": False,
+                            "message": f"ミッション項目 {seq + 1} の取得がタイムアウトしました",
+                            "items": []}
+                cmd = int(got.command)
+                if got.get_type() == "MISSION_ITEM_INT":
+                    lat, lon = got.x / 1e7, got.y / 1e7
+                else:
+                    lat, lon = float(got.x), float(got.y)
+                item = {
+                    "type": MISSION_CMD_TO_TYPE.get(cmd, "other"),
+                    "lat": lat, "lon": lon, "altM": float(got.z),
+                }
+                if item["type"] == "other":
+                    item["command"] = cmd
+                items.append(item)
+            with mav_lock:
+                mav.mav.mission_ack_send(ts, tc, MAV_MISSION_ACCEPTED, mmt)
+            # Seq 0 is ArduPilot's home slot (see cmd_mission_upload):
+            # it is never flown, so the editor list starts at seq 1.
+            items = items[1:]
+            push_log(6, f"ミッションをダウンロードしました ({len(items)}件)")
+            return {"ok": True,
+                    "message": f"機体のミッションを読み込みました（{len(items)}件）",
+                    "items": items}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"ミッションのダウンロードに失敗: {e}", "items": []}
+        finally:
+            with lock:
+                S["missionBusy"] = False
+
+
+def cmd_mission_clear():
+    mav = get_mav()
+    if mav is None:
+        return {"ok": False, "message": "未接続のためミッションを消去できません"}
+    with mission_lock:
+        with lock:
+            S["missionBusy"] = True
+        try:
+            time.sleep(0.3)
+            ts, tc = mav.target_system, mav.target_component
+            mmt = mavutil.mavlink.MAV_MISSION_TYPE_MISSION
+            state = {"lastHb": 0.0}
+            with mav_lock:
+                mav.mav.mission_clear_all_send(ts, tc, mmt)
+            deadline = time.time() + 6
+            while time.time() < deadline:
+                msg = _xfer_recv(mav, state, 1.5)
+                if msg is not None and msg.get_type() == "MISSION_ACK":
+                    if int(msg.type) == MAV_MISSION_ACCEPTED:
+                        push_log(6, "機体のミッションを消去しました")
+                        return {"ok": True, "message": "機体のミッションを消去しました"}
+                    return {"ok": False,
+                            "message": f"機体がミッション消去を拒否しました (結果 {int(msg.type)})"}
+            return {"ok": False, "message": "ミッション消去の応答がタイムアウトしました"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": f"ミッション消去に失敗: {e}"}
+        finally:
+            with lock:
+                S["missionBusy"] = False
+
+
+def cmd_mission_start(takeoff_alt):
+    """Start the uploaded mission. Airborne: just engage AUTO. On the
+    ground: ArduPilot refuses to arm in AUTO ("Auto mode not armable"),
+    and an AUTO takeoff from the ground waits for an RC throttle raise
+    that a GCS-only setup never sends (verified live: armed in GUIDED,
+    switched to AUTO on the ground, it sat at alt 0 and auto-disarmed).
+    So take off in GUIDED first, then engage AUTO once airborne; the
+    mission resumes at its takeoff item (already reached) and flies on
+    through the waypoints."""
+    mav = get_mav()
+    if mav is None:
+        return {"ok": False, "message": "未接続のためミッションを開始できません"}
+    with lock:
+        airborne = S["armed"] and (S["altRelM"] or 0) > 2
+    if airborne:
+        r = cmd_set_mode("AUTO")
+        if r.get("ok"):
+            return {"ok": True, "message": "ミッションを開始しました（AUTO）"}
+        return r
+
+    def seq():
+        try:
+            # Verify the GUIDED change actually took effect before
+            # arming: right after a cold SITL boot a set_mode sent in
+            # the first seconds can be overwritten by the boot's own
+            # initial mode (verified live: the vehicle stayed in
+            # STABILIZE and the GUIDED-only NAV_TAKEOFF was rejected).
+            mode_deadline = time.time() + 10
+            while True:
+                cmd_set_mode("GUIDED")
+                time.sleep(1.2)
+                with lock:
+                    cur_mode = S["mode"]
+                if cur_mode == "GUIDED":
+                    break
+                if time.time() > mode_deadline:
+                    push_log(3, "ミッション開始中止: GUIDEDに切り替わりませんでした")
+                    return
+            with lock:
+                is_armed = S["armed"]
+            if not is_armed:
+                # Right after connect the EKF/home may still be warming
+                # up and a single ARM is rejected (PreArm: Need Position
+                # Estimate — seen live). Retry until the vehicle arms.
+                arm_deadline = time.time() + 45
+                while time.time() < arm_deadline:
+                    r = cmd_arm(True)
+                    if not r.get("ok"):
+                        push_log(3, f"ミッション開始中止: {r.get('message')}")
+                        return
+                    time.sleep(1.5)
+                    with lock:
+                        is_armed = S["armed"]
+                    if is_armed:
+                        break
+                if not is_armed:
+                    push_log(3, "ミッション開始中止: アームできませんでした")
+                    return
+                time.sleep(0.5)
+
+            def send_takeoff():
+                m2 = get_mav()
+                if m2 is None:
+                    return
+                with mav_lock:
+                    m2.mav.command_long_send(
+                        m2.target_system, m2.target_component,
+                        MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0,
+                        float(takeoff_alt))
+
+            send_takeoff()
+            push_log(6, f"ミッション開始: GUIDEDで{takeoff_alt}mまで離陸 → AUTO")
+            deadline = time.time() + 40
+            resent = False
+            while time.time() < deadline:
+                with lock:
+                    alt = S["altRelM"] or 0
+                    is_armed = S["armed"]
+                if not is_armed:
+                    push_log(3, "ミッション開始: 離陸前にディスアームされました")
+                    return
+                if alt >= takeoff_alt * 0.85:
+                    break
+                if not resent and alt < 1 and time.time() > deadline - 32:
+                    resent = True
+                    send_takeoff()
+                time.sleep(0.5)
+            cmd_set_mode("AUTO")
+            push_log(6, "ミッション開始: AUTOに移行しました")
+        except Exception as e:  # noqa: BLE001
+            push_log(3, f"ミッション開始シーケンスでエラー: {e}")
+
+    threading.Thread(target=seq, daemon=True).start()
+    return {"ok": True, "message": "ミッションを開始します（離陸後にAUTOへ移行）"}
+
+
 def cmd_connect(host, port):
     with lock:
         S["host"] = host
@@ -483,6 +821,7 @@ def snapshot():
         "acks": s["acks"][:8],
         "joyEnabled": s["joyEnabled"], "joyStreaming": s["joyStreaming"],
         "joyUpdatedAgoMs": None if not s["joyUpdatedAt"] else int((time.time() - s["joyUpdatedAt"]) * 1000),
+        "missionCurrent": s["missionCurrent"], "missionReached": s["missionReached"],
     }
 
 
@@ -529,6 +868,15 @@ class Handler(BaseHTTPRequestHandler):
                     float(body["lat"]), float(body["lon"]), float(body.get("altM", 10))))
             elif self.path == "/joystick":
                 self._json(200, cmd_joystick(body))
+            elif self.path == "/mission/upload":
+                items = body.get("items")
+                self._json(200, cmd_mission_upload(items if isinstance(items, list) else []))
+            elif self.path == "/mission/download":
+                self._json(200, cmd_mission_download())
+            elif self.path == "/mission/clear":
+                self._json(200, cmd_mission_clear())
+            elif self.path == "/mission/start":
+                self._json(200, cmd_mission_start(float(body.get("takeoffAltM", 10))))
             else:
                 self._json(404, {"ok": False, "message": "not found"})
         except Exception as e:  # noqa: BLE001

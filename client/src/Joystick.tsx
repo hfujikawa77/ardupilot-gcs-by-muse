@@ -75,9 +75,10 @@ export function Stick({ label, horizontalName, verticalName, size = 148, onChang
           style={{
             width: knobSize,
             height: knobSize,
-            left: `calc(50% + ${knob.x}px - ${knobSize / 2}px)`,
-            top: `calc(50% + ${knob.y}px - ${knobSize / 2}px)`,
-            transition: dragging ? "none" : "left 0.18s ease-out, top 0.18s ease-out",
+            left: `calc(50% - ${knobSize / 2}px)`,
+            top: `calc(50% - ${knobSize / 2}px)`,
+            transform: `translate(${knob.x}px, ${knob.y}px)`,
+            transition: dragging ? "none" : "transform 0.18s ease-out",
           }}
         />
       </div>

@@ -1,4 +1,24 @@
-// Live map (Meta map runtime, per the maps reference).
+// Live map (bundled map runtime, per the maps reference).
+//
+// Basemap source: the default is the Meta "dark" vector style, fetched
+// through the map runtime's own same-origin proxy mode. In proxy mode
+// the runtime rewrites every map resource (style JSON, tiles, glyphs,
+// sprites) to `<page origin>/api/map-proxy/…`, so the browser only ever
+// talks to the origin that served this page. That matters because the
+// direct hosts have both failed on the user's PC while the phone on the
+// same Wi-Fi worked: first fbcdn (Meta vector tiles), then Microsoft's
+// tile hosts (the previous build's bing-hybrid default) — two unrelated
+// third-party hosts blocked on one PC (security software / filtering
+// DNS) while the app itself, which only talks to its own origin, worked
+// fine. The public mount wrapper hard-codes the runtime's fetch-mode
+// constant to "cdn" and never reads it from mount options, so the local
+// vendored copy in client/src/assets/hatch-maps.js carries a one-token
+// patch (W7 "cdn" -> "proxy") selecting the runtime's own proxy mode.
+// The 航空写真 toggle still offers the runtime's bing-hybrid raster
+// preset (Microsoft aerial tiles with baked-in labels, QGC's classic
+// look); raster presets ignore the fetch mode and load directly from
+// Microsoft's hosts, so that source remains a per-device alternative,
+// and the unavailable fallback offers the same switch as a retry.
 //
 // The vendored control renders its `places` as a static GeoJSON snapshot,
 // so the vehicle is NOT one of its places: a snapshot pin would sit at the
@@ -15,21 +35,45 @@
 // Goto), the live source/layers, and follow-panning. A watchdog interval
 // re-discovers and re-attaches after every remount, so a slow style load
 // no longer permanently disables tap/live updates. If the instance never
-// appears (~20 s), we fall back to snapshot pins that remount whenever the
-// vehicle crosses a ~25 m grid cell, so the marker still tracks coarsely.
+// appears (~20 s), initialization is judged failed and the panel switches
+// to the WebGL-free 2D fallback map (see the round-3 note below).
 //
 // Home and target stay as control places: home never moves, and a new
 // target remounts anyway (which also moves its pin).
+//
+// 2D fallback (round 3): three network-side changes (fbcdn direct, Bing
+// via MapLibre, same-origin proxy) all failed identically on the user's
+// PC, and chrome://gpu evidence from that PC settled why: at the exact
+// moment the map was tried, the GPU log records "eglCreateContext:
+// Requested version is not supported" — MapLibre's WebGL context
+// creation fails at the driver level (AMD Radeon, driver 31.0.12014.6,
+// ANGLE/D3D11), even though chrome://gpu calls WebGL "hardware
+// accelerated" and a generic getContext probe can pass. The failure was
+// never the network. So failure is judged by the ACTUAL initialization
+// result — the runtime's fatal-error callback (its error boundary
+// catches the WebGL init throw) or the MapLibre instance never
+// appearing — and on failure the panel switches to TileMap2D, a
+// WebGL-free map of plain <img> raster tiles with DOM/SVG overlays,
+// instead of the previous snapshot-pin fallback (which still mounted
+// the same GL control and was therefore equally dead on that PC). The
+// coordinates text panel remains only for the case where the 2D tiles
+// also cannot load.
 
 import { useEffect, useRef, useState } from "react";
 import "./assets/hatch-maps.js";
 import "./assets/hatch-maps.css";
 import { mountMap, type MapHandle, type MapPlace } from "./map_helpers.mjs";
+import { TileMap2D } from "./TileMap2D";
 
 export interface LatLon { lat: number; lon: number }
 
 /** One flown-track point; altM is its relative altitude in metres. */
 export interface TrackPoint extends LatLon { altM?: number }
+
+/** One mission-editor point shown on the map. `index` is the item's
+ * position in the editor list (RTL items have no point); `label` is the
+ * 1-based sequence number drawn on the marker. */
+export interface MissionPoint extends LatLon { index: number; label: string }
 
 interface MapPanelProps {
   vehicle: LatLon | null;
@@ -41,6 +85,10 @@ interface MapPanelProps {
   recenterSignal: number;
   onTap?: (p: LatLon) => void;
   onTapReady?: (ready: boolean) => void;
+  missionPoints?: MissionPoint[];
+  missionSelected?: number | null;
+  onMissionPointMove?: (index: number, p: LatLon) => void;
+  onMissionPointSelect?: (index: number) => void;
 }
 
 interface GeoJsonSourceLike {
@@ -59,12 +107,15 @@ interface MapLibreLike {
   getCenter: () => { lat: number; lng: number };
   easeTo: (opts: { center?: [number, number]; duration?: number; pitch?: number }) => void;
   setPitch?: (pitch: number) => void;
+  getPitch?: () => number;
   project: (lngLat: [number, number]) => { x: number; y: number };
+  unproject: (point: [number, number]) => { lat: number; lng: number };
 }
 
 const LIVE_SOURCE = "gcs-live";
 const VEHICLE_LAYER = "gcs-vehicle";
 const TRACK_LAYER = "gcs-track";
+const MISSION_LAYER = "gcs-mission-line";
 const VEHICLE_IMAGE = "gcs-aircraft";
 
 // Walk the React fiber tree rooted at the holder element (the map control
@@ -147,7 +198,10 @@ function makeVehicleImage(): ImageData | null {
   }
 }
 
-function buildLiveData(vehicle: LatLon | null, headingDeg: number | null, track: TrackPoint[]) {
+function buildLiveData(
+  vehicle: LatLon | null, headingDeg: number | null, track: TrackPoint[],
+  missionPoints: MissionPoint[],
+) {
   const features: unknown[] = [];
   if (track.length > 1) {
     features.push({
@@ -157,6 +211,16 @@ function buildLiveData(vehicle: LatLon | null, headingDeg: number | null, track:
         coordinates: track.map((p) => [p.lon, p.lat]),
       },
       properties: { kind: "track" },
+    });
+  }
+  if (missionPoints.length > 1) {
+    features.push({
+      type: "Feature",
+      geometry: {
+        type: "LineString",
+        coordinates: missionPoints.map((p) => [p.lon, p.lat]),
+      },
+      properties: { kind: "mission" },
     });
   }
   if (vehicle) {
@@ -173,6 +237,7 @@ const OBLIQUE_PITCH = 55;
 
 export function MapPanel({
   vehicle, headingDeg, altRelM, home, target, track, recenterSignal, onTap, onTapReady,
+  missionPoints, missionSelected, onMissionPointMove, onMissionPointSelect,
 }: MapPanelProps) {
   const holderRef = useRef<HTMLDivElement>(null);
   const handleRef = useRef<MapHandle | null>(null);
@@ -185,6 +250,12 @@ export function MapPanel({
   const onTapReadyRef = useRef(onTapReady);
   onTapReadyRef.current = onTapReady;
   const [unavailable, setUnavailable] = useState(false);
+  // Basemap source: the Meta "dark" vector style by default — the
+  // vendored runtime is patched to its same-origin proxy fetch mode, so
+  // its style/tiles/glyphs/sprites all load from this page's own origin
+  // (see the header comment). "bing-hybrid" is the direct-fetch aerial
+  // alternative.
+  const [basemap, setBasemap] = useState<"bing-hybrid" | "dark">("dark");
   const [fallback, setFallback] = useState(false);
   const [follow, setFollow] = useState(true);
   const followRef = useRef(true);
@@ -214,14 +285,105 @@ export function MapPanel({
   // the overlay draws the vehicle on its altitude post and the track as
   // a true 3D path (each point lifted by its own altitude), instead of
   // the ground-hugging 2D line the flat view uses.
-  const liveDataRef = useRef(buildLiveData(vehicle, headingDeg, track));
+  const missionPointsRef = useRef<MissionPoint[]>(missionPoints ?? []);
+  missionPointsRef.current = missionPoints ?? [];
+  const liveDataRef = useRef(buildLiveData(vehicle, headingDeg, track, missionPoints ?? []));
   liveDataRef.current = buildLiveData(
-    oblique ? null : vehicle, headingDeg, oblique ? [] : track,
+    oblique ? null : vehicle, headingDeg, oblique ? [] : track, missionPoints ?? [],
   );
   const vehicleRef = useRef(vehicle);
   vehicleRef.current = vehicle;
   const trackRef = useRef(track);
   trackRef.current = track;
+
+  // ---- mission waypoint markers (DOM, draggable) ----
+  // Numbered markers are DOM elements rather than GeoJSON symbols:
+  // the number must render on every basemap (the raster aerial style
+  // has no glyphs for a text layer), and DOM markers give us pointer
+  // drag for free. Positions are refreshed imperatively from the map's
+  // render events (the same hook the oblique overlay uses).
+  const missionMarkersRef = useRef<HTMLDivElement>(null);
+  const markerElsRef = useRef(new Map<number, HTMLDivElement>());
+  const onMissionPointMoveRef = useRef(onMissionPointMove);
+  onMissionPointMoveRef.current = onMissionPointMove;
+  const onMissionPointSelectRef = useRef(onMissionPointSelect);
+  onMissionPointSelectRef.current = onMissionPointSelect;
+
+  const positionMissionMarkersRef = useRef(() => undefined as void);
+  positionMissionMarkersRef.current = () => {
+    const map = attachedMapRef.current;
+    if (!map || typeof map.project !== "function") return;
+    for (const p of missionPointsRef.current) {
+      const el = markerElsRef.current.get(p.index);
+      if (!el) continue;
+      try {
+        const s = map.project([p.lon, p.lat]);
+        el.style.transform = `translate(${s.x.toFixed(1)}px, ${s.y.toFixed(1)}px) translate(-50%, -50%)`;
+      } catch { /* map mid-teardown */ }
+    }
+  };
+
+  const missionSig = JSON.stringify({
+    pts: (missionPoints ?? []).map((p) => [p.index, p.label]),
+    sel: missionSelected ?? null,
+  });
+  useEffect(() => {
+    const container = missionMarkersRef.current;
+    if (!container) return;
+    container.innerHTML = "";
+    markerElsRef.current = new Map();
+    for (const p of missionPointsRef.current) {
+      const el = document.createElement("div");
+      const selected = missionSelected != null && missionSelected === p.index;
+      el.textContent = p.label;
+      el.setAttribute("role", "button");
+      el.setAttribute("aria-label", `ウェイポイント ${p.label}（ドラッグで移動）`);
+      el.style.cssText =
+        "position:absolute;left:0;top:0;width:24px;height:24px;border-radius:9999px;" +
+        "display:flex;align-items:center;justify-content:center;" +
+        "font:700 12px ui-monospace,Menlo,Consolas,monospace;pointer-events:auto;" +
+        "touch-action:none;cursor:grab;user-select:none;-webkit-user-select:none;" +
+        `background:${selected ? "#f5b83d" : "rgba(245,184,61,0.92)"};` +
+        `color:#0b1116;border:2px solid ${selected ? "#ffffff" : "#0b1116"};` +
+        `box-shadow:0 2px 8px rgba(0,0,0,0.55);z-index:${selected ? 6 : 5};`;
+      let dragging = false;
+      el.addEventListener("pointerdown", (e) => {
+        e.stopPropagation();
+        e.preventDefault();
+        dragging = true;
+        el.setPointerCapture(e.pointerId);
+        el.style.cursor = "grabbing";
+        onMissionPointSelectRef.current?.(p.index);
+      });
+      el.addEventListener("pointermove", (e) => {
+        if (!dragging) return;
+        const map = attachedMapRef.current;
+        const holder = holderRef.current;
+        if (!map || !holder || typeof map.unproject !== "function") return;
+        const rect = holder.getBoundingClientRect();
+        try {
+          const ll = map.unproject([e.clientX - rect.left, e.clientY - rect.top]);
+          onMissionPointMoveRef.current?.(p.index, { lat: ll.lat, lon: ll.lng });
+        } catch { /* map mid-teardown */ }
+      });
+      const endDrag = () => {
+        dragging = false;
+        el.style.cursor = "grab";
+      };
+      el.addEventListener("pointerup", endDrag);
+      el.addEventListener("pointercancel", endDrag);
+      container.appendChild(el);
+      markerElsRef.current.set(p.index, el);
+    }
+    positionMissionMarkersRef.current();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [missionSig, fallback]);
+
+  // Keep markers glued when their coordinates change without a camera
+  // move (a drag posts new positions through props on every move).
+  useEffect(() => {
+    positionMissionMarkersRef.current();
+  }, [missionPoints]);
 
   // ---- altitude-post overlay (oblique view only) ----
   // Ground point = the vehicle's lat/lon projected to screen space; the
@@ -333,6 +495,7 @@ export function MapPanel({
   };
   const renderCbRef = useRef(() => {
     drawOverlayRef.current();
+    positionMissionMarkersRef.current();
   });
 
   const clickCbRef = useRef((e: { lngLat?: { lat: number; lng: number } }) => {
@@ -356,14 +519,15 @@ export function MapPanel({
     onTapReadyRef.current?.(false);
   };
 
-  // ---- mount the vendored control (static places: home + target only;
-  // in fallback mode the vehicle joins them as a coarse snapshot pin) ----
+  // ---- mount the vendored control (static places: home + target only).
+  // A fatal initialization error (the runtime's error boundary catches
+  // the WebGL context-creation throw on PCs whose driver rejects
+  // MapLibre's context request) switches straight to the WebGL-free 2D
+  // map — judged by the actual init result, not by a generic WebGL
+  // probe, which can pass while the real context creation fails. ----
   useEffect(() => {
-    if (!vehicle || unavailable) return;
-    const cell = fallback
-      ? [Math.round(vehicle.lat * 4444), Math.round(vehicle.lon * 4444)]
-      : null;
-    const sig = JSON.stringify({ t: target, h: home, fb: fallback, cell });
+    if (!vehicle || unavailable || fallback) return;
+    const sig = JSON.stringify({ t: target, h: home, bm: basemap });
     if (sig === sigRef.current && handleRef.current) return;
     sigRef.current = sig;
     const el = holderRef.current;
@@ -372,7 +536,6 @@ export function MapPanel({
     handleRef.current?.destroy();
     handleRef.current = null;
     const places: MapPlace[] = [];
-    if (fallback) places.push({ label: "機体", lat: vehicle.lat, lng: vehicle.lon });
     if (home) places.push({ label: "ホーム", lat: home.lat, lng: home.lon });
     if (target) places.push({ label: "目標", lat: target.lat, lng: target.lon });
     const focus = target ?? vehicle;
@@ -382,14 +545,25 @@ export function MapPanel({
         places,
         center: { lat: focus.lat, lng: focus.lon },
         zoom: target ? 16 : 17,
-        baseStyle: "dark",
+        baseStyle: basemap,
       },
-      () => setUnavailable(true),
+      () => setFallback(true),
     );
     handleRef.current = handle;
     if (handle) mountAtRef.current = Date.now();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vehicle, home, target, unavailable, fallback]);
+  }, [vehicle, home, target, unavailable, fallback, basemap]);
+
+  // Entering 2D fallback: tear the GL control down completely so no
+  // half-initialized canvas or context lingers under the tile map.
+  useEffect(() => {
+    if (!fallback) return;
+    detach();
+    handleRef.current?.destroy();
+    handleRef.current = null;
+    sigRef.current = "";
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fallback]);
 
   // ---- watchdog: discover the MapLibre instance, attach handlers and
   // the live source/layers, keep the live data fresh, and follow ----
@@ -443,6 +617,17 @@ export function MapPanel({
               },
             });
           }
+          if (!map.getLayer(MISSION_LAYER)) {
+            map.addLayer({
+              id: MISSION_LAYER, type: "line", source: LIVE_SOURCE,
+              filter: ["==", ["get", "kind"], "mission"],
+              layout: { "line-cap": "round", "line-join": "round" },
+              paint: {
+                "line-color": "#f5b83d", "line-width": 2, "line-opacity": 0.9,
+                "line-dasharray": [2, 1.6],
+              },
+            });
+          }
         } catch {
           // Style not fully loaded yet; retry on the next tick without
           // marking the map as attached.
@@ -490,7 +675,32 @@ export function MapPanel({
             },
           });
         }
+        if (!map.getLayer(MISSION_LAYER)) {
+          map.addLayer({
+            id: MISSION_LAYER, type: "line", source: LIVE_SOURCE,
+            filter: ["==", ["get", "kind"], "mission"],
+            layout: { "line-cap": "round", "line-join": "round" },
+            paint: {
+              "line-color": "#f5b83d", "line-width": 2, "line-opacity": 0.9,
+              "line-dasharray": [2, 1.6],
+            },
+          });
+        }
       } catch { /* style mid-reload; next tick retries */ }
+      // Oblique enforcement: while oblique is on, keep the camera
+      // pitched. A follow/centering easeTo (or a style reload) that
+      // interrupts the toggle's pitch animation can otherwise leave
+      // the camera nearly flat, making the toggle look dead even
+      // though the state flipped — re-assert the pitch directly.
+      if (obliqueRef.current) {
+        try {
+          const p = typeof map.getPitch === "function" ? map.getPitch() : null;
+          if (p !== null && p < OBLIQUE_PITCH - 2) {
+            if (typeof map.setPitch === "function") map.setPitch(OBLIQUE_PITCH);
+            else map.easeTo({ pitch: OBLIQUE_PITCH, duration: 300 });
+          }
+        } catch { /* map mid-teardown */ }
+      }
       // Push fresh geometry whenever it changed.
       const data = liveDataRef.current;
       const json = JSON.stringify(data);
@@ -506,7 +716,13 @@ export function MapPanel({
         try {
           const c = map.getCenter();
           if (haversineM({ lat: c.lat, lon: c.lng }, v) > 12) {
-            map.easeTo({ center: [v.lon, v.lat], duration: 500 });
+            // While oblique is on, name the pitch in the follow
+            // animation too: a centre-only easeTo restarts the camera
+            // animation and can strand the pitch mid-toggle.
+            map.easeTo({
+              center: [v.lon, v.lat], duration: 500,
+              ...(obliqueRef.current ? { pitch: OBLIQUE_PITCH } : {}),
+            });
           }
         } catch { /* map mid-teardown */ }
       }
@@ -551,6 +767,8 @@ export function MapPanel({
   }, []);
 
   if (unavailable) {
+    // Reached only when the WebGL-free 2D map's tiles also failed to
+    // load: both renderers are unavailable on this device/network.
     return (
       <div className="flex h-full min-h-[150px] flex-col items-center justify-center gap-2 p-4 text-center">
         <div className="text-sm">地図を表示できません</div>
@@ -560,19 +778,50 @@ export function MapPanel({
             : "機体位置: 未取得"}
         </div>
         <div className="max-w-sm text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
+          3D地図の初期化と、WebGL不要の2D地図のタイル取得の両方に失敗しました。ネットワーク接続を確認して再試行してください。
+        </div>
+        <button
+          type="button"
+          className="btn"
+          aria-label="地図を再試行"
+          onClick={() => {
+            setUnavailable(false);
+            setFallback(false);
+          }}
+        >
+          地図を再試行
+        </button>
+        <div className="max-w-sm text-xs leading-relaxed" style={{ color: "var(--dim)" }}>
           目標地点は Goto タブの緯度・経度入力、または「現在位置を入力」「ホームを入力」ボタンで指定できます。
         </div>
       </div>
+    );
+  }
+  if (fallback && vehicle) {
+    return (
+      <TileMap2D
+        vehicle={vehicle}
+        headingDeg={headingDeg}
+        altRelM={altRelM}
+        home={home}
+        target={target}
+        track={track}
+        recenterSignal={recenterSignal}
+        onTap={onTap}
+        onTapReady={onTapReady}
+        onTilesFailed={() => setUnavailable(true)}
+        missionPoints={missionPoints}
+        missionSelected={missionSelected}
+        onMissionPointMove={onMissionPointMove}
+        onMissionPointSelect={onMissionPointSelect}
+      />
     );
   }
   if (!vehicle) {
     return (
       <div className="flex h-full min-h-[150px] flex-col items-center justify-center gap-2 p-4 text-center">
         <div className="text-sm" style={{ color: "var(--dim)" }}>
-          GPS測位を待っています…
-        </div>
-        <div className="text-xs" style={{ color: "var(--dim)" }}>
-          位置が取得できると地図に機体・ホーム・目標が表示されます
+          GPS未測位
         </div>
       </div>
     );
@@ -580,6 +829,14 @@ export function MapPanel({
   return (
     <div className="relative h-full">
       <div ref={holderRef} className="map-holder" aria-label="機体位置の地図" />
+      {/* mission waypoint markers: numbered, draggable DOM chips
+          (created imperatively above; positioned on map render) */}
+      <div
+        ref={missionMarkersRef}
+        className="pointer-events-none absolute inset-0 overflow-hidden"
+        style={{ zIndex: 4 }}
+        aria-hidden="true"
+      />
       {/* oblique-view overlay: the 3D track (ground projection + altitude
           posts + the lifted path) and the vehicle floating on its own
           altitude post above its ground projection */}
@@ -618,18 +875,56 @@ export function MapPanel({
           style={{ paintOrder: "stroke", stroke: "rgba(11,17,22,0.85)", strokeWidth: 3 }}
         />
       </svg>
-      {!fallback && (
+      {/* basemap source switch: 地図 = Meta vector style fetched through
+          this page's own origin (runtime proxy mode); 航空写真 = aerial
+          tiles fetched directly from Microsoft's hosts. The two take
+          different network paths, so switching rescues the map when one
+          path is blocked on this device. */}
+      <div
+        className="absolute left-2 top-2 flex overflow-hidden"
+        style={{ zIndex: 5, border: "1px solid var(--border)", borderRadius: 8, background: "rgba(13,21,28,0.92)" }}
+        role="group"
+        aria-label="地図ソースの切り替え"
+      >
         <button
           type="button"
-          className={`btn absolute bottom-2 right-2 !px-2 !py-1 text-[11px] ${oblique ? "active" : ""}`}
-          style={{ background: "rgba(13,21,28,0.92)", zIndex: 5 }}
-          aria-pressed={oblique}
-          aria-label="斜めビュー（ピッチ表示）の切り替え"
-          onClick={toggleOblique}
+          className="!px-2 !py-1 text-[11px]"
+          style={{
+            background: basemap === "dark" ? "rgba(34,211,238,0.14)" : "transparent",
+            color: basemap === "dark" ? "var(--accent)" : "var(--text)",
+            border: "none", cursor: "pointer",
+          }}
+          aria-pressed={basemap === "dark"}
+          aria-label="通常の地図ソース"
+          onClick={() => setBasemap("dark")}
         >
-          {oblique ? "斜めビュー中（3D軌跡・高度ポスト）" : "斜めビュー"}
+          地図
         </button>
-      )}
+        <button
+          type="button"
+          className={`!px-2 !py-1 text-[11px] ${basemap === "bing-hybrid" ? "text-[var(--accent)]" : ""}`}
+          style={{
+            background: basemap === "bing-hybrid" ? "rgba(34,211,238,0.14)" : "transparent",
+            color: basemap === "bing-hybrid" ? "var(--accent)" : "var(--text)",
+            border: "none", borderLeft: "1px solid var(--border)", cursor: "pointer",
+          }}
+          aria-pressed={basemap === "bing-hybrid"}
+          aria-label="航空写真の地図ソース"
+          onClick={() => setBasemap("bing-hybrid")}
+        >
+          航空写真
+        </button>
+      </div>
+      <button
+        type="button"
+        className={`btn absolute bottom-2 right-2 !px-2 !py-1 text-[11px] ${oblique ? "active" : ""}`}
+        style={{ background: "rgba(13,21,28,0.92)", zIndex: 5 }}
+        aria-pressed={oblique}
+        aria-label="斜めビュー（ピッチ表示）の切り替え"
+        onClick={toggleOblique}
+      >
+        {oblique ? "斜めビュー中（3D軌跡・高度ポスト）" : "斜めビュー"}
+      </button>
       <button
         type="button"
         className={`btn absolute bottom-2 left-2 !px-2 !py-1 text-[11px] ${follow ? "active" : ""}`}
@@ -650,14 +945,6 @@ export function MapPanel({
       >
         {follow ? "追従中（タップで解除）" : "機体を追従"}
       </button>
-      {fallback && (
-        <div
-          className="mono pointer-events-none absolute bottom-2 right-2 rounded px-1.5 py-0.5 text-[10px]"
-          style={{ background: "rgba(11,17,22,0.75)", color: "var(--dim)" }}
-        >
-          ピン更新モード
-        </div>
-      )}
     </div>
   );
 }
